@@ -19,6 +19,8 @@ interface HomeProps {
 
 const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile, userRole, tournaments = [] }) => {
   const [loading, setLoading] = useState(true);
+  /** Sum of tournament_scores — source of truth (profiles.points can be stale after tournament deletes) */
+  const [seasonPointsLive, setSeasonPointsLive] = useState<number | null>(null);
   
   // Use global prop for source of truth with robust fallbacks
   const userName = userProfile?.username || userProfile?.full_name?.split(' ')[0] || 'Judoka';
@@ -87,7 +89,27 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
     };
 
     fetchTopJudokas();
-  }, []); 
+  }, []);
+
+  useEffect(() => {
+    const uid = userProfile?.id;
+    if (!uid) {
+      setSeasonPointsLive(0);
+      return;
+    }
+    (async () => {
+      const { data, error } = await supabase
+        .from('tournament_scores')
+        .select('total_points')
+        .eq('user_id', uid);
+      if (error) {
+        setSeasonPointsLive(userProfile?.points ?? 0);
+        return;
+      }
+      const sum = (data || []).reduce((acc, row) => acc + (row.total_points || 0), 0);
+      setSeasonPointsLive(sum);
+    })();
+  }, [userProfile?.id, userProfile?.points]);
 
   const handleManagePredictions = () => {
     if (heroTournament) {
@@ -186,7 +208,7 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
           />
           <StatCard 
              label="Season Points" 
-             value={userProfile?.points ? userProfile.points.toLocaleString() : '0'} 
+             value={seasonPointsLive !== null ? seasonPointsLive.toLocaleString() : (userProfile?.points?.toLocaleString() ?? '0')} 
              subValue="Total accumulated" 
              icon={Zap} 
              color="text-purple-600" 
@@ -205,20 +227,35 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
                     className="group relative overflow-hidden bg-slate-900 rounded-2xl shadow-zen text-white p-6 md:p-8 transition-all hover:shadow-xl hover:-translate-y-1 duration-500 cursor-pointer"
                     onClick={handleManagePredictions}
                   >
-                      <div className={`absolute top-0 right-0 p-24 rounded-full blur-[80px] opacity-40 -translate-y-1/2 translate-x-1/3 animate-pulse-soft ${heroTournament.status === 'SORTING' ? 'bg-amber-500' : 'bg-blue-500'}`}></div>
+                      <div className={`absolute top-0 right-0 p-24 rounded-full blur-[80px] opacity-40 -translate-y-1/2 translate-x-1/3 animate-pulse-soft ${
+                        (heroTournament.status || '').toUpperCase() === 'SORTING' ? 'bg-amber-500'
+                        : (heroTournament.status || '').toUpperCase() === 'COMPLETED' ? 'bg-slate-500'
+                        : (heroTournament.status || '').toUpperCase() === 'LIVE' ? 'bg-red-500'
+                        : 'bg-blue-500'
+                      }`}></div>
                       
                       <div className="relative z-10">
                           <div className="flex items-center gap-3 mb-4">
-                              <span className={`px-2.5 py-1 rounded border text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 animate-pulse ${
-                                  heroTournament.status === 'SORTING' 
-                                    ? 'bg-amber-500/20 border-amber-500/30 text-amber-200' 
-                                    : (heroTournament.status === 'DRAFT' || heroTournament.status === 'UPCOMING')
-                                        ? 'bg-blue-500/20 border-blue-500/30 text-blue-200'
-                                        : 'bg-red-500/20 border-red-500/30 text-red-400'
-                              }`}>
-                                  <span className={`size-1.5 rounded-full ${heroTournament.status === 'SORTING' ? 'bg-amber-400' : (heroTournament.status === 'DRAFT' || heroTournament.status === 'UPCOMING') ? 'bg-blue-400' : 'bg-red-500'}`}></span>
-                                  {heroTournament.status === 'SORTING' ? 'PREDICTIONS OPEN' : (heroTournament.status === 'DRAFT' || heroTournament.status === 'UPCOMING') ? 'COMING SOON' : 'LIVE'}
-                              </span>
+                              {(() => {
+                                const s = (heroTournament.status || '').toUpperCase();
+                                const isCompleted = s === 'COMPLETED';
+                                const isSorting = s === 'SORTING';
+                                const isDraft = s === 'DRAFT' || s === 'UPCOMING';
+                                const isLive = s === 'LIVE';
+                                return (
+                                  <span className={`px-2.5 py-1 rounded border text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 ${!isCompleted ? 'animate-pulse' : ''} ${
+                                    isSorting ? 'bg-amber-500/20 border-amber-500/30 text-amber-200'
+                                    : isDraft ? 'bg-blue-500/20 border-blue-500/30 text-blue-200'
+                                    : isCompleted ? 'bg-slate-500/20 border-slate-500/30 text-slate-300'
+                                    : 'bg-red-500/20 border-red-500/30 text-red-400'
+                                  }`}>
+                                    <span className={`size-1.5 rounded-full ${
+                                      isSorting ? 'bg-amber-400' : isDraft ? 'bg-blue-400' : isCompleted ? 'bg-slate-400' : 'bg-red-500'
+                                    }`}></span>
+                                    {isSorting ? 'PREDICTIONS OPEN' : isDraft ? 'COMING SOON' : isCompleted ? 'COMPLETED' : 'LIVE'}
+                                  </span>
+                                );
+                              })()}
                               <span className="text-slate-400 text-sm font-medium">
                                   {formatHeroDate(heroTournament.date)}
                               </span>
@@ -232,7 +269,13 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
                             icon={ArrowRight}
                             className="group-hover:pl-8 transition-all"
                           >
-                            {heroTournament.status === 'SORTING' ? 'Make Predictions' : (heroTournament.status === 'DRAFT' || heroTournament.status === 'UPCOMING') ? 'View Athletes' : 'View Bracket'}
+                            {(() => {
+                              const s = (heroTournament.status || '').toUpperCase();
+                              return s === 'SORTING' ? 'Make Predictions'
+                                : (s === 'DRAFT' || s === 'UPCOMING') ? 'View Athletes'
+                                : s === 'COMPLETED' ? 'View Results'
+                                : 'View Bracket';
+                            })()}
                           </Button>
                       </div>
                   </div>

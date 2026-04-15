@@ -52,7 +52,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
         }
 
         if (officialData && officialData.length > 0) {
-          // TRANSFORMACIÓN DE DATOS (Aplanamiento)
+          // DATA TRANSFORMATION (flattening)
           const formattedRoster: Competitor[] = officialData.map((p: any) => {
             const judoka = p.judokas;
             // Si el join falla o es null, lo saltamos
@@ -64,7 +64,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                 country: judoka.country_code || 'N/A',
                 rank: p.ranking_external || 'UR',
                 sex: judoka.gender === 'Male' ? 'M' : 'F',
-                // Traemos el peso real desde la relación categories
+                // Get the real weight from the categories relation
                 weight: p.categories ? p.categories.name : 'N/A', 
                 flagUrl: ''
             };
@@ -113,7 +113,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
 
   if (!tournament) return null;
 
-  // --- LÓGICA DE FILTROS ---
+  // --- FILTER LOGIC ---
   const availableWeights = useMemo(() => {
     const weights = new Set<string>();
     roster.forEach(c => {
@@ -170,7 +170,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
     return <div className="size-6 bg-slate-100 text-slate-500 rounded-full flex items-center justify-center font-bold text-xs">{!isNaN(r) && r > 0 ? `#${r}` : '-'}</div>;
   }
 
-  // Helper para el color del estado (Unificando estética)
+  // Helper for status color (unified styling)
   const getStatusStyle = (status: string) => {
       switch(status) {
           case 'LIVE': return 'bg-red-50 text-red-600 animate-pulse';

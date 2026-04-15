@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { ViewState, UserRole, UserPicks, Match, Tournament, Competitor } from '../types';
 import MatchCard from '../components/MatchCard';
-import { ArrowLeft, ChevronDown, Loader2, CheckCircle, Trophy, Lock, PanelLeftOpen, PanelLeftClose, Search, Check, Play, BarChart3, ClipboardCheck } from 'lucide-react';
+import { ArrowLeft, ChevronDown, Loader2, CheckCircle, Trophy, Lock, PanelLeftOpen, PanelLeftClose, Search, Check, Play, BarChart3, ClipboardCheck, Medal } from 'lucide-react';
 import Flag from '../components/ui/Flag';
 import { supabase } from '../lib/supabaseClient';
+import { calculateMyScore } from '../lib/scoringEngine';
+import { getBracketParticipantCount, buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds } from '../lib/bracketUtils';
 
 interface BracketProps {
   onNavigate: (view: ViewState) => void;
@@ -15,19 +17,6 @@ interface BracketProps {
   userRole?: UserRole;
   onStatusChange?: (tournamentId: string, newStatus: string) => void;
 }
-
-const getBracketSize = (participants: number) => {
-  const sizes = [2, 4, 8, 16, 32, 64, 128];
-  return sizes.find(s => s >= participants) || 128;
-};
-
-const getRoundOrder = (round: string) => {
-  if (round === 'F') return 100;
-  if (round === 'SF') return 90;
-  if (round === 'QF') return 80;
-  if (round.startsWith('R')) return parseInt(round.substring(1));
-  return 0;
-};
 
 const BracketNode: React.FC<{
   match: Match;
@@ -107,11 +96,18 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
   const [allCategoryCompetitors, setAllCategoryCompetitors] = useState<Competitor[]>([]);
   const [rawDbMatches, setRawDbMatches] = useState<any[]>([]);
   const [matchResults, setMatchResults] = useState<Record<string, string>>({});
+  const [sidebarDropActive, setSidebarDropActive] = useState(false);
   const [userScore, setUserScore] = useState<{ points: number; correct: number; total: number } | null>(null);
-  const [localStatus, setLocalStatus] = useState(tournament?.status);
+  const [localStatus, setLocalStatus] = useState(tournament?.status?.toUpperCase());
+
+  useEffect(() => {
+    if (tournament?.status) {
+      setLocalStatus(tournament.status.toUpperCase());
+    }
+  }, [tournament?.status]);
 
   const isAdmin = userRole === 'ADMIN';
-  const effectiveStatus = localStatus || tournament?.status;
+  const effectiveStatus = (localStatus || tournament?.status || '').toUpperCase();
   const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED';
   const showDragDrop = isAdmin && effectiveStatus !== 'LIVE' && effectiveStatus !== 'COMPLETED';
 
@@ -134,6 +130,11 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
     const placed = list.filter(c => placedIds.has(c.id));
     return { unplaced, placed };
   }, [allCategoryCompetitors, placedIds, sidebarSearch]);
+
+  const predictedMedalistIds = useMemo(
+    () => getPredictedMedalistCompetitorIds(matches, picks),
+    [matches, picks]
+  );
 
   useEffect(() => {
     const loadData = async () => {
@@ -178,7 +179,6 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               name: `${(athlete.last_name || '').toUpperCase()} ${athlete.first_name || ''}`.trim(),
               country: athlete.country || 'N/A',
               flagUrl: '',
-              rank: 'UR',
               weight: athlete.weight_category,
             };
           });
@@ -200,7 +200,6 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                 name: bd.competitor1.name,
                 country: bd.competitor1.country || 'N/A',
                 flagUrl: '',
-                rank: 'UR',
               });
             }
             if (bd?.competitor2?.name) {
@@ -209,90 +208,37 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                 name: bd.competitor2.name,
                 country: bd.competitor2.country || 'N/A',
                 flagUrl: '',
-                rank: 'UR',
               });
             }
           });
 
+          // Pool must include every roster athlete in this weight class — not only names
+          // still present in bracket_data. After unassign, slots are null in DB; those
+          // judokas would otherwise disappear from the sidebar when reloading the category.
+          const normalizeWeight = (s: string) =>
+            s.toLowerCase().replace(/\s+/g, '').replace(/^(men'?s?|women'?s?|male|female)/i, '');
+          const selNorm = normalizeWeight(selectedCategory || '');
+          Object.values(rosterMap).forEach((athlete: Competitor) => {
+            const w = (athlete as Competitor & { weight?: string }).weight || '';
+            if (!w || !selNorm) return;
+            const wNorm = normalizeWeight(w);
+            const matchesCat =
+              wNorm === selNorm || wNorm.includes(selNorm) || selNorm.includes(wNorm);
+            if (!matchesCat) return;
+            const dup = categoryCompetitors.some(
+              c => c.id === athlete.id || (c.name === athlete.name && c.country === athlete.country)
+            );
+            if (!dup) categoryCompetitors.push(athlete);
+          });
+
           if (categoryMatches.length > 0) {
-            const numR1FromDb = categoryMatches.length;
-            const size = getBracketSize(numR1FromDb * 2);
-            const fullR1Count = size / 2;
-
-            const resolveCompetitor = (m: any, slot: 'competitor1' | 'competitor2', idField: string) => {
-              if (m && m[idField] && rosterMap[m[idField]]) return rosterMap[m[idField]];
-              const bd = m?.bracket_data;
-              if (bd && bd[slot] && bd[slot].name) {
-                return {
-                  id: `pdf-${m.id}-${slot}`,
-                  name: bd[slot].name,
-                  country: bd[slot].country || 'N/A',
-                  flagUrl: '',
-                  rank: 'UR',
-                };
-              }
-              return null;
-            };
-
-            // Only create R1 matches for actual DB entries — NO padding
-            for (let i = 0; i < numR1FromDb; i++) {
-              const m = categoryMatches[i];
-
-              let pool = '';
-              if (fullR1Count >= 4) {
-                const poolSize = fullR1Count / 4;
-                pool = String.fromCharCode(65 + Math.floor(i / poolSize));
-              } else if (fullR1Count === 2) {
-                pool = i === 0 ? 'A' : 'B';
-              }
-
-              const c1 = resolveCompetitor(m, 'competitor1', 'competitor_1');
-              const c2 = resolveCompetitor(m, 'competitor2', 'competitor_2');
-
-              freshMatches.push({
-                id: m.id || `r1-m${i}`,
-                round: 'R1',
-                pool: pool || undefined,
-                matchNumber: m.match_number || i + 1,
-                competitor1: c1,
-                competitor2: c2,
-                winnerId: null,
-                nextMatchId: size > 2 ? `r2-m${Math.floor(i / 2)}` : undefined,
-                nextMatchSlot: i % 2 === 0 ? 1 : 2,
-              });
-            }
-
-            // Build R2+ based on the full bracket size
-            let currentRoundMatches = fullR1Count / 2;
-            let roundLevel = 2;
-            let matchCounter = fullR1Count + 1;
-            while (currentRoundMatches >= 1) {
-              for (let i = 0; i < currentRoundMatches; i++) {
-                const isFinal = currentRoundMatches === 1;
-                let pool = '';
-                if (!isFinal) {
-                  if (currentRoundMatches >= 4) {
-                    const poolSize = currentRoundMatches / 4;
-                    pool = String.fromCharCode(65 + Math.floor(i / poolSize));
-                  } else if (currentRoundMatches === 2) {
-                    pool = i === 0 ? 'A' : 'B';
-                  }
-                }
-                freshMatches.push({
-                  id: `r${roundLevel}-m${i}`,
-                  round: isFinal ? 'F' : `R${roundLevel}`,
-                  pool: pool || undefined,
-                  matchNumber: matchCounter++,
-                  competitor1: null,
-                  competitor2: null,
-                  winnerId: null,
-                  nextMatchId: isFinal ? undefined : `r${roundLevel + 1}-m${Math.floor(i / 2)}`,
-                  nextMatchSlot: i % 2 === 0 ? 1 : 2,
-                });
-              }
-              currentRoundMatches /= 2;
-              roundLevel++;
-            }
+            const hasRepechage = !!tournament?.scoring_configuration?.has_repechage;
+            freshMatches.push(...buildMatchesForBracket(
+              categoryMatches,
+              rosterMap,
+              selectedCategory,
+              hasRepechage
+            ));
           }
         }
 
@@ -327,21 +273,22 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           } catch { /* table may not exist yet */ }
         }
 
-        const storageKey = `tippon-picks-${tournament.id}-${selectedCategory}`;
+        // User-scoped localStorage key prevents cross-user data leakage on shared devices
+        const storageKey = `tippon-picks-${userId || 'anon'}-${tournament.id}-${selectedCategory}`;
         let savedLocal: UserPicks = {};
         try {
           const raw = localStorage.getItem(storageKey);
           if (raw) savedLocal = JSON.parse(raw);
         } catch { /* ignore */ }
 
-        // Priority: DB > existingPicks (React state) > localStorage
+        // Priority: DB (user-scoped) > localStorage (user-scoped) > existingPicks fallback
         const saved = Object.keys(savedDb).length > 0
           ? savedDb
-          : (existingPicks?.[selectedCategory] || savedLocal);
+          : (savedLocal && Object.keys(savedLocal).length > 0 ? savedLocal : (existingPicks?.[selectedCategory] || {}));
         const mergedPicks = { ...currentPicks, ...saved };
 
         // Fase 5: Load match results when tournament is COMPLETED
-        if (tournament.status === 'COMPLETED' || localStatus === 'COMPLETED') {
+        if (effectiveStatus === 'COMPLETED') {
           try {
             const { data: resultsData } = await supabase
               .from('match_results')
@@ -354,16 +301,26 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               resultsData.forEach(r => { resultsMap[r.match_id] = r.winner_competitor_id; });
               setMatchResults(resultsMap);
 
-              // Calculate user score for this category
-              let correct = 0;
-              let total = 0;
-              Object.entries(mergedPicks).forEach(([matchId, pickedId]) => {
-                if (resultsMap[matchId]) {
-                  total++;
-                  if (resultsMap[matchId] === pickedId) correct++;
-                }
-              });
-              setUserScore({ points: 0, correct, total });
+              // Auto-calculate and persist this user's score (fixes RLS issue where
+              // admin-side batch calculation can't read other users' picks).
+              // Each user calculates their own score from their own picks.
+              if (userId && Object.keys(mergedPicks).length > 0) {
+                calculateMyScore(tournament.id as string, selectedCategory, userId, mergedPicks)
+                  .then(score => setUserScore(score))
+                  .catch(() => {
+                    // Fallback: compute locally without persisting
+                    let correct = 0, total = 0;
+                    Object.entries(mergedPicks).forEach(([matchId, pickedId]) => {
+                      if (resultsMap[matchId]) {
+                        total++;
+                        if (resultsMap[matchId] === pickedId) correct++;
+                      }
+                    });
+                    setUserScore({ points: 0, correct, total });
+                  });
+              } else {
+                setUserScore(null);
+              }
             } else {
               setMatchResults({});
               setUserScore(null);
@@ -375,8 +332,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
         }
 
         // Rehydrate winners — sorted by round order to propagate correctly
-        const sortedRounds = Array.from(new Set(freshMatches.map(m => m.round)))
-          .sort((a, b) => getRoundOrder(a) - getRoundOrder(b));
+        const sortedRounds = sortedUniqueRounds(freshMatches);
 
         sortedRounds.forEach(r => {
           freshMatches.filter(m => m.round === r).forEach(match => {
@@ -394,6 +350,17 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                 else target.competitor2 = winner;
               }
             }
+
+            // Propagate loser to repechage / bronze
+            if (match.loserNextMatchId && match.competitor1 && match.competitor2) {
+              const loser = match.competitor1.id === winnerId ? match.competitor2 : match.competitor1;
+              const loserTarget = freshMatches.find(tm => tm.id === match.loserNextMatchId);
+              if (loserTarget && loser) {
+                if (match.loserNextMatchSlot === 1) loserTarget.competitor1 = loser;
+                else loserTarget.competitor2 = loser;
+              }
+            }
+
             if (match.round === 'F' && winnerId) setChampion(winnerId);
           });
         });
@@ -410,10 +377,49 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
     loadData();
   }, [selectedCategory, tournament?.id, existingPicks, userId, localStatus]);
 
+  // When the tournament is COMPLETED, calculate and persist scores for ALL
+  // categories at once. This ensures every user appears in the full leaderboard
+  // regardless of which category tab they currently have open.
+  useEffect(() => {
+    if (effectiveStatus !== 'COMPLETED' || !userId || !tournament?.id) return;
+
+    (async () => {
+      // Fetch the exact category labels from competition_brackets (e.g. 'Men -60kg')
+      // rather than tournament.categories.male (e.g. '-60kg') which won't match picks keys.
+      const { data: bracketData } = await supabase
+        .from('competition_brackets')
+        .select('weight_category')
+        .eq('tournament_id', tournament.id);
+
+      const allCategories = Array.from(
+        new Set((bracketData || []).map((m: any) => m.weight_category).filter(Boolean))
+      ) as string[];
+
+      for (const cat of allCategories) {
+        try {
+          const { data: dbPicks } = await supabase
+            .from('user_picks')
+            .select('picks_data')
+            .eq('user_id', userId)
+            .eq('tournament_id', tournament.id)
+            .eq('category', cat)
+            .single();
+
+          if (dbPicks?.picks_data && Object.keys(dbPicks.picks_data).length > 0) {
+            await calculateMyScore(tournament.id as string, cat, userId, dbPicks.picks_data);
+          }
+        } catch {
+          // No picks for this user in this category — expected.
+        }
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tournament?.id, userId, effectiveStatus]);
+
   // --- ADMIN: Status Change Handlers ---
   const handleGoLive = async () => {
     if (!tournament?.id || !isAdmin) return;
-    if (!confirm('¿Iniciar el torneo? Los picks de los jugadores quedarán bloqueados.')) return;
+    if (!confirm('Start the tournament? All player picks will be locked.')) return;
     try {
       const { error } = await supabase
         .from('tournaments')
@@ -424,7 +430,39 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       onStatusChange?.(tournament.id, 'LIVE');
     } catch (err) {
       console.error('Error changing status to LIVE:', err);
-      alert('Error al cambiar estado del torneo');
+      alert('Error changing tournament status.');
+    }
+  };
+
+  // --- UNASSIGN HANDLER (drag a competitor back to the sidebar) ---
+  const handleUnassignCompetitor = (competitor: Competitor) => {
+    setMatches(prev => {
+      const cloned = prev.map(m => ({ ...m }));
+      cloned.filter(m => m.round === 'R1').forEach(m => {
+        if (m.competitor1?.id === competitor.id) m.competitor1 = null;
+        if (m.competitor2?.id === competitor.id) m.competitor2 = null;
+      });
+      return cloned;
+    });
+
+    // Persist removal to Supabase
+    const dbMatch = rawDbMatches.find((m: any) => {
+      const bd = m.bracket_data || {};
+      return (bd.competitor1?.name === competitor.name && bd.competitor1?.country === competitor.country)
+          || (bd.competitor2?.name === competitor.name && bd.competitor2?.country === competitor.country);
+    });
+    if (dbMatch) {
+      const updatedBd = { ...(dbMatch.bracket_data || {}) };
+      if (updatedBd.competitor1?.name === competitor.name && updatedBd.competitor1?.country === competitor.country) {
+        updatedBd.competitor1 = null;
+      }
+      if (updatedBd.competitor2?.name === competitor.name && updatedBd.competitor2?.country === competitor.country) {
+        updatedBd.competitor2 = null;
+      }
+      supabase.from('competition_brackets')
+        .update({ bracket_data: updatedBd })
+        .eq('id', dbMatch.id)
+        .then(({ error }) => { if (error) console.error("Error unassigning competitor:", error); });
     }
   };
 
@@ -469,23 +507,45 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
     const match = matches.find(m => m.id === matchId);
     if (!match) return;
 
-    const newPicks = { ...picks, [matchId]: competitorId };
+    let newPicks: UserPicks = { ...picks, [matchId]: competitorId };
+    const medalists = getPredictedMedalistCompetitorIds(matches, newPicks);
+    if (newPicks['additional_pick'] && medalists.has(newPicks['additional_pick'])) {
+      const next = { ...newPicks };
+      delete next['additional_pick'];
+      newPicks = next;
+    }
     setPicks(newPicks);
 
-    if (match.nextMatchId) {
+    const winner = match.competitor1?.id === competitorId ? match.competitor1 : match.competitor2;
+    const loser = match.competitor1?.id === competitorId ? match.competitor2 : match.competitor1;
+
+    if (match.nextMatchId || match.loserNextMatchId) {
       setMatches(prev => {
         const cloned = prev.map(m => ({ ...m }));
-        const winner = match.competitor1?.id === competitorId ? match.competitor1 : match.competitor2;
-        const target = cloned.find(m => m.id === match.nextMatchId);
-        if (target && winner) {
-          if (match.nextMatchSlot === 1) target.competitor1 = winner;
-          else target.competitor2 = winner;
+
+        // Propagate winner forward
+        if (match.nextMatchId && winner) {
+          const target = cloned.find(m => m.id === match.nextMatchId);
+          if (target) {
+            if (match.nextMatchSlot === 1) target.competitor1 = winner;
+            else target.competitor2 = winner;
+          }
         }
+
+        // Propagate loser to repechage / bronze (only when both slots are filled)
+        if (match.loserNextMatchId && loser && match.competitor1 && match.competitor2) {
+          const loserTarget = cloned.find(m => m.id === match.loserNextMatchId);
+          if (loserTarget) {
+            if (match.loserNextMatchSlot === 1) loserTarget.competitor1 = loser;
+            else loserTarget.competitor2 = loser;
+          }
+        }
+
         return cloned;
       });
-    } else if (match.round === 'F') {
-      setChampion(competitorId);
     }
+
+    if (match.round === 'F') setChampion(competitorId);
   };
 
   // --- SAVE HANDLER ---
@@ -493,14 +553,23 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
     if (isReadOnly || !tournament) return;
     setIsSubmitting(true);
 
-    const storageKey = `tippon-picks-${tournament.id}-${selectedCategory}`;
-    localStorage.setItem(storageKey, JSON.stringify(picks));
+    const medalists = getPredictedMedalistCompetitorIds(matches, picks);
+    let toSave: UserPicks = { ...picks };
+    if (toSave['additional_pick'] && medalists.has(toSave['additional_pick'])) {
+      const { additional_pick: _x, ...rest } = toSave;
+      toSave = rest as UserPicks;
+      setPicks(toSave);
+    }
 
+    const storageKey = `tippon-picks-${userId || 'anon'}-${tournament.id}-${selectedCategory}`;
+    localStorage.setItem(storageKey, JSON.stringify(toSave));
+
+    const bracketPickCount = Object.keys(toSave).filter(k => k !== 'additional_pick').length;
     const completion = matches.length > 0
-      ? Math.round((Object.keys(picks).length / matches.length) * 100)
+      ? Math.round((bracketPickCount / matches.length) * 100)
       : 0;
 
-    onSavePicks?.(tournament.id, selectedCategory, picks, completion);
+    onSavePicks?.(tournament.id, selectedCategory, toSave, completion);
 
     setTimeout(() => {
       setIsSubmitting(false);
@@ -511,7 +580,11 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
 
   if (isLoading) return <div className="h-full flex items-center justify-center"><Loader2 className="animate-spin text-primary" size={48} /></div>;
 
-  const roundsToRender = Array.from(new Set(matches.map(m => m.round))).sort((a, b) => getRoundOrder(a) - getRoundOrder(b));
+  const mainMatches = matches.filter(m => m.roundType !== 'repechage' && m.roundType !== 'bronze');
+  const repMatches = matches.filter(m => m.roundType === 'repechage');
+  const bronzeMatches = matches.filter(m => m.roundType === 'bronze');
+  const hasRepechageSection = repMatches.length > 0 || bronzeMatches.length > 0;
+  const roundsToRender = sortedUniqueRounds(mainMatches);
   const totalSidebar = filteredSidebarCompetitors.unplaced.length + filteredSidebarCompetitors.placed.length;
 
   return (
@@ -533,13 +606,13 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               )}
               {userScore && (
                 <span className="text-xs font-bold px-3 py-1 rounded-full bg-emerald-100 text-emerald-700">
-                  {userScore.correct}/{userScore.total} aciertos
+                  {userScore.correct}/{userScore.total} correct
                 </span>
               )}
             </div>
             <div className="relative">
                 <button onClick={() => setIsCategoryDropdownOpen(!isCategoryDropdownOpen)} className="text-primary text-sm font-bold flex items-center gap-1">
-                {selectedCategory || 'Seleccionar categoría'} <ChevronDown size={14}/>
+                {selectedCategory || 'Select category'} <ChevronDown size={14}/>
                 </button>
                 {isCategoryDropdownOpen && (
                   <div className="absolute top-full left-0 mt-1 w-48 bg-white rounded-md shadow-lg border border-slate-200 z-50 max-h-72 overflow-y-auto">
@@ -569,7 +642,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               className="bg-red-500 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-red-600 transition-colors text-sm"
             >
               <Play size={16} />
-              Iniciar Torneo
+              Start Tournament
             </button>
           )}
 
@@ -579,17 +652,37 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-emerald-700 transition-colors text-sm"
             >
               <ClipboardCheck size={16} />
-              Ingresar Resultados
+              Enter Results
             </button>
           )}
 
           {effectiveStatus === 'COMPLETED' && (
+            <>
+              <button
+                onClick={() => onNavigate('TOURNAMENT_FINAL_RESULTS')}
+                className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-indigo-700 transition-colors text-sm"
+              >
+                <Trophy size={16} />
+                Final results
+              </button>
+              <button
+                onClick={() => onNavigate('TOURNAMENT_LEADERBOARD')}
+                className="bg-purple-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-purple-700 transition-colors text-sm"
+              >
+                <BarChart3 size={16} />
+                Leaderboard
+              </button>
+            </>
+          )}
+
+          {(effectiveStatus === 'DRAFT' || effectiveStatus === 'UPCOMING') && (
             <button
-              onClick={() => onNavigate('TOURNAMENT_LEADERBOARD')}
-              className="bg-purple-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-purple-700 transition-colors text-sm"
+              type="button"
+              onClick={() => onNavigate('MEDAL_TABLE_PICKS')}
+              className="bg-amber-500 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-amber-600 transition-colors text-sm"
             >
-              <BarChart3 size={16} />
-              Leaderboard
+              <Medal size={16} />
+              Medal table picks
             </button>
           )}
 
@@ -598,7 +691,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
             <button
               onClick={() => setSidebarOpen(!sidebarOpen)}
               className="p-2 hover:bg-slate-100 rounded-lg text-slate-500"
-              title={sidebarOpen ? 'Cerrar panel' : 'Abrir panel de Judokas'}
+              title={sidebarOpen ? 'Close panel' : 'Open Judokas panel'}
             >
               {sidebarOpen ? <PanelLeftClose size={20} /> : <PanelLeftOpen size={20} />}
             </button>
@@ -612,7 +705,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           ) : showSaved ? (
             <div className="flex items-center gap-2 px-6 py-2 bg-green-500 text-white rounded-lg font-bold shadow-lg shadow-green-500/20 animate-pulse">
               <Check size={18} />
-              Guardado!
+              Saved!
             </div>
           ) : (
             <button 
@@ -621,7 +714,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               className="bg-primary text-white px-6 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-blue-600 transition-colors shadow-lg shadow-blue-500/20 disabled:opacity-50"
             >
               {isSubmitting ? <Loader2 className="animate-spin" size={18}/> : <CheckCircle size={18}/>}
-              {isSubmitting ? 'Guardando...' : 'Save Picks'}
+              {isSubmitting ? 'Saving...' : 'Save Picks'}
             </button>
           )}
         </div>
@@ -630,7 +723,30 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       <div className="flex flex-1 overflow-hidden">
         {/* --- JUDOKA SIDEBAR (admin bracket building only) --- */}
         {sidebarOpen && showDragDrop && (
-          <aside className="w-72 bg-white border-r border-slate-200 flex flex-col flex-shrink-0">
+          <aside
+            className="w-72 bg-white border-r border-slate-200 flex flex-col flex-shrink-0"
+            onDragOver={(e) => { e.preventDefault(); setSidebarDropActive(true); }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setSidebarDropActive(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setSidebarDropActive(false);
+              try {
+                const raw = e.dataTransfer.getData('application/json');
+                if (raw) handleUnassignCompetitor(JSON.parse(raw) as Competitor);
+              } catch { /* ignore */ }
+            }}
+          >
+            {/* Drop-to-remove zone */}
+            <div className={`mx-2 mt-2 mb-1 rounded-lg border-2 border-dashed flex items-center justify-center gap-2 transition-all text-xs font-bold uppercase tracking-wider py-2 ${
+              sidebarDropActive
+                ? 'border-red-400 bg-red-50 text-red-500'
+                : 'border-slate-200 text-slate-300'
+            }`}>
+              <span>{sidebarDropActive ? '↩ Drop to unassign' : 'Drag here to remove'}</span>
+            </div>
+
             <div className="p-3 border-b border-slate-100">
               <h3 className="text-xs font-black text-slate-500 uppercase tracking-wider mb-2">
                 Judokas ({totalSidebar})
@@ -639,7 +755,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                 <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
                   type="text"
-                  placeholder="Buscar..."
+                  placeholder="Search..."
                   value={sidebarSearch}
                   onChange={e => setSidebarSearch(e.target.value)}
                   className="w-full pl-7 pr-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
@@ -651,7 +767,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               {filteredSidebarCompetitors.unplaced.length > 0 && (
                 <>
                   <p className="text-[10px] font-bold text-orange-500 uppercase tracking-wider px-1 pt-1">
-                    Sin colocar ({filteredSidebarCompetitors.unplaced.length})
+                    Unplaced ({filteredSidebarCompetitors.unplaced.length})
                   </p>
                   {filteredSidebarCompetitors.unplaced.map(c => (
                     <div
@@ -675,7 +791,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               {filteredSidebarCompetitors.placed.length > 0 && (
                 <>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-1 pt-2">
-                    Colocados ({filteredSidebarCompetitors.placed.length})
+                    Placed ({filteredSidebarCompetitors.placed.length})
                   </p>
                   {filteredSidebarCompetitors.placed.map(c => (
                     <div
@@ -698,7 +814,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
 
               {totalSidebar === 0 && (
                 <p className="text-xs text-slate-400 text-center py-4">
-                  {sidebarSearch ? 'Sin resultados' : 'No hay judokas para esta categoría'}
+                  {sidebarSearch ? 'No results found' : 'No judokas in this category'}
                 </p>
               )}
             </div>
@@ -722,11 +838,11 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
             </div>
 
             <div className="flex items-center flex-1">
-              {matches.filter(m => m.round === 'F').map(finalMatch => (
-                <BracketNode 
+              {mainMatches.filter(m => m.round === 'F').map(finalMatch => (
+                <BracketNode
                   key={finalMatch.id}
                   match={finalMatch}
-                  matches={matches}
+                  matches={mainMatches}
                   picks={picks}
                   handlePick={handlePick}
                   handleDrop={handleDropCompetitor}
@@ -751,6 +867,149 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                 </div>
               </div>
             </div>
+
+            {/* ── REPECHAGE & BRONZE SECTION ─────────────────────────────────── */}
+            {hasRepechageSection && (
+              <div className="mt-14 pt-10 border-t-2 border-dashed border-slate-300">
+
+                {/* Repechage round */}
+                {repMatches.length > 0 && (
+                  <div className="mb-10">
+                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 text-center">
+                      Repechage
+                    </p>
+                    <div className="flex gap-12 justify-center">
+                      {repMatches.map((m, i) => (
+                        <div key={m.id} className="flex flex-col items-center gap-2">
+                          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                            {repMatches.length > 1 ? `Pool ${i === 0 ? 'A/B' : 'C/D'}` : 'Repechage'}
+                          </span>
+                          <MatchCard
+                            match={m}
+                            onPick={handlePick}
+                            selectedId={picks[m.id]}
+                            topCompetitor={m.competitor1}
+                            bottomCompetitor={m.competitor2}
+                            isLocked={isReadOnly || !m.competitor1 || !m.competitor2}
+                            resultStatus={
+                              matchResults[m.id] && picks[m.id]
+                                ? (matchResults[m.id] === picks[m.id] ? 'correct' : 'incorrect')
+                                : null
+                            }
+                            actualWinnerId={matchResults[m.id]}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Bronze medal matches */}
+                {bronzeMatches.length > 0 && (
+                  <div>
+                    <p className="text-xs font-black text-amber-600 uppercase tracking-widest mb-2 text-center">
+                      🥉 Bronze Medal {bronzeMatches.length > 1 ? 'Matches' : 'Match'}
+                    </p>
+                    {bronzeMatches.length > 1 && (
+                      <p className="text-[10px] text-slate-400 text-center mb-5">
+                        Cross-over: SF_1 loser vs REP C/D winner · SF_2 loser vs REP A/B winner
+                      </p>
+                    )}
+                    <div className="flex gap-12 justify-center">
+                      {bronzeMatches.map((m, i) => (
+                        <div key={m.id} className="flex flex-col items-center gap-2">
+                          <span className="text-[10px] font-bold text-amber-500 uppercase tracking-wider">
+                            {bronzeMatches.length > 1 ? `Bronze ${i + 1}` : 'Bronze'}
+                          </span>
+                          <MatchCard
+                            match={m}
+                            onPick={handlePick}
+                            selectedId={picks[m.id]}
+                            topCompetitor={m.competitor1}
+                            bottomCompetitor={m.competitor2}
+                            isLocked={isReadOnly || !m.competitor1 || !m.competitor2}
+                            resultStatus={
+                              matchResults[m.id] && picks[m.id]
+                                ? (matchResults[m.id] === picks[m.id] ? 'correct' : 'incorrect')
+                                : null
+                            }
+                            actualWinnerId={matchResults[m.id]}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          {/* ── ADDITIONAL PICK (Zusatztipp) ───────────────────────────── */}
+          {(() => {
+            const allAthletes: Competitor[] = matches
+              .filter(m => m.round === 'R1')
+              .reduce<Competitor[]>((acc, m) => {
+                if (m.competitor1) acc.push(m.competitor1);
+                if (m.competitor2) acc.push(m.competitor2);
+                return acc;
+              }, []);
+            const uniqueAthletes: Competitor[] = Array.from(
+              new Map(allAthletes.map(c => [c.id, c])).values()
+            ).sort((a, b) => a.name.localeCompare(b.name));
+            const eligibleForAp = uniqueAthletes.filter((c) => !predictedMedalistIds.has(c.id));
+            const selectedAP = picks['additional_pick'] || '';
+            const apResult = matchResults && selectedAP
+              ? (() => {
+                  // check if in actual standings: look through match results for F/B/SF to see position
+                  const finalM = matches.find(m => m.round === 'F');
+                  const bronzeMs = matches.filter(m => m.round === 'B');
+                  const sfMs = matches.filter(m => m.round === 'SF');
+                  const allFinalMatches = [finalM, ...bronzeMs, ...sfMs].filter(Boolean);
+                  const isTop7 = allFinalMatches.some(m => m && (matchResults[m!.id] === selectedAP || m!.competitor1?.id === selectedAP || m!.competitor2?.id === selectedAP));
+                  return null; // detailed result shown in leaderboard
+                })()
+              : null;
+            if (uniqueAthletes.length === 0) return null;
+            return (
+              <div className="mt-10 pt-8 border-t-2 border-dashed border-slate-300">
+                <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 text-center">
+                  Additional Pick — Zusatztipp
+                </p>
+                <div className="flex justify-center">
+                  <div className="w-80 bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+                    <p className="text-xs text-slate-500 mb-3">
+                      Select one athlete you think will finish in the <strong>Top 7</strong> who is <strong>not</strong> one of your predicted medalists (gold/silver/bronze):
+                    </p>
+                    <select
+                      value={selectedAP && !predictedMedalistIds.has(selectedAP) ? selectedAP : ''}
+                      onChange={(e) => {
+                        if (!isReadOnly) {
+                          const v = e.target.value;
+                          setPicks((prev) => {
+                            const next = { ...prev };
+                            if (!v) delete next['additional_pick'];
+                            else next['additional_pick'] = v;
+                            return next;
+                          });
+                        }
+                      }}
+                      disabled={isReadOnly}
+                      className="w-full h-10 px-3 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none disabled:opacity-60"
+                    >
+                      <option value="">— No selection —</option>
+                      {eligibleForAp.map((c) => (
+                        <option key={c.id} value={c.id}>{c.name} ({c.country})</option>
+                      ))}
+                    </select>
+                    {selectedAP && (
+                      <p className="mt-2 text-[11px] text-slate-400 text-center">
+                        +{2} pts if this athlete reaches the top 7
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           </div>
         </main>
       </div>

@@ -1,0 +1,12 @@
+---
+description: All project UI, code comments, alerts, docs for agents, and user-facing copy must be in English
+alwaysApply: true
+---
+
+# English-only (Tippon)
+
+**Disclaimer:** Everything related to this project—**user-visible strings**, **developer-facing comments**, **commit messages**, **alerts**, **tooltips**, **error messages**, **agent/Composer instructions in-repo**, and **documentation meant for maintainers**—must be written in **English**.
+
+- Do not introduce Spanish or other languages in the codebase unless explicitly requested for a localized feature (i18n), which this project does not use by default.
+- Existing Spanish in legacy files should be migrated to English when touched.
+- Config/docs pairing (`CONFIG_PROTOCOL_README.md` / `CLAUDE.md`) remains in English.

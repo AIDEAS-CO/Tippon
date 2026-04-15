@@ -111,7 +111,7 @@ const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfi
       }
   };
 
-  // --- ACTUALIZACIÓN DE DATOS (Solo Username) ---
+  // --- DATA UPDATE (Username only) ---
   const handleSaveAccount = async () => {
       if (!userProfile) return;
 

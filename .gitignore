@@ -16,7 +16,10 @@ dist-ssr
 .vscode/*
 !.vscode/extensions.json
 .idea
-.cursor
+# Cursor — ignore local cache; keep shared agent rules
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
 .DS_Store
 *.suo
 *.ntvs*
@@ -27,6 +30,7 @@ dist-ssr
 # IDE metadata
 metadata.json
 migrated_prompt_history/
+.claude/
 
 # Sample/test data files
 *.pdf

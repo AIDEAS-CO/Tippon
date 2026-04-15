@@ -6,6 +6,7 @@ import Button from './ui/Button';
 import Flag from './ui/Flag';
 import { supabase } from '../lib/supabaseClient';
 import * as XLSX from 'xlsx';
+import { buildCategoryLookup, resolveCanonicalWeightCategory } from '../lib/rosterImportUtils';
 
 interface TournamentRosterProps {
   onNavigate: (view: ViewState) => void;
@@ -96,11 +97,14 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
   // Derived filters
   const uniqueCountries = useMemo(() => Array.from(new Set(competitors.map(c => c.country))).sort(), [competitors]);
   const uniqueWeights = useMemo(() => {
-    const weights = Array.from(new Set(competitors.map(c => c.weight)));
-    return weights.sort((a, b) => {
-        const parseWeight = (w: string | undefined) => {
+    const weightSet = new Set<string>();
+    for (const c of competitors) {
+      weightSet.add(c.weight ?? '');
+    }
+    return Array.from(weightSet).sort((a, b) => {
+        const parseWeight = (w: string) => {
             if (!w) return 0;
-            const num = parseInt(w.replace(/[^0-9]/g, ''));
+            const num = parseInt(w.replace(/[^0-9]/g, ''), 10);
             if (isNaN(num)) return -1;
             if (w.includes('+')) return num + 0.5;
             return num;
@@ -158,95 +162,136 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    
-    // CRITICAL: ID CHECK
+
     if (!file || !tournament?.id) {
-       if (!tournament?.id) {
-           console.error("UPLOAD ERROR: Tournament ID is missing from state!");
-           alert("Error: No se pudo encontrar el ID del torneo. Por favor regresa al paso anterior y vuelve a entrar.");
-       }
-       return;
+      if (!tournament?.id) {
+        console.error('UPLOAD ERROR: Tournament ID is missing from state!');
+        alert(
+          'Error: Tournament ID is missing. Go back to the previous step and try again.'
+        );
+      }
+      return;
     }
 
-    console.log("Uploading roster for Tournament ID:", tournament.id);
-    
     setIsProcessing(true);
     const reader = new FileReader();
+    const isCsv = file.name.toLowerCase().endsWith('.csv');
 
     reader.onload = async (e) => {
-        try {
-            const allowedMale = new Set(dbCategories?.filter(c => c.gender === 'Male').map(c => c.name.toLowerCase()) || []);
-            const allowedFemale = new Set(dbCategories?.filter(c => c.gender === 'Female').map(c => c.name.toLowerCase()) || []);
+      try {
+        const lookup = buildCategoryLookup(dbCategories || []);
 
-            const data = new Uint8Array(e.target?.result as ArrayBuffer);
-            const workbook = XLSX.read(data, { type: 'array' });
-            const firstSheetName = workbook.SheetNames[0];
-            const worksheet = workbook.Sheets[firstSheetName];
-            
-            const rows = XLSX.utils.sheet_to_json<any[]>(worksheet, { header: 1 });
-            const insertPayload = [];
-            let skippedCount = 0;
-
-            for (let i = 1; i < rows.length; i++) {
-                const row = rows[i];
-                if (!row || row.length === 0) continue;
-
-                const clean = (val: any) => val ? String(val).trim() : '';
-                const rankStr = clean(row[1]).replace('#', '');
-                const country = clean(row[4]) || 'UNK';
-                const firstName = clean(row[6]);
-                const lastName = clean(row[7]);
-                const genderRaw = clean(row[8]).toLowerCase();
-                const categoryRaw = clean(row[9]);
-
-                if (!firstName && !lastName) continue;
-
-                const rank = parseInt(rankStr) || 999;
-                const sex = genderRaw.includes('f') || genderRaw === 'female' ? 'Female' : 'Male';
-                
-                let weightPart = categoryRaw.split(' ')[0];
-                if (weightPart && !weightPart.toLowerCase().endsWith('kg')) weightPart += 'kg';
-
-                const isAllowed = sex === 'Male' 
-                    ? allowedMale.has(weightPart.toLowerCase()) 
-                    : allowedFemale.has(weightPart.toLowerCase());
-
-                if (!isAllowed) {
-                    skippedCount++;
-                    continue;
-                }
-
-                insertPayload.push({
-                    tournament_id: tournament.id,
-                    first_name: firstName,
-                    last_name: lastName,
-                    country: country,
-                    gender: sex,
-                    weight_category: weightPart,
-                    world_rank: rank
-                });
-            }
-
-            if (insertPayload.length === 0) {
-                alert(`No valid athletes found. Skipped ${skippedCount} athletes who did not match categories.`);
-                return;
-            }
-
-            const { error } = await supabase.from('tournament_roster').insert(insertPayload);
-            if (error) throw error;
-
-            alert(`Success! Imported ${insertPayload.length} athletes. (Skipped ${skippedCount})`);
-            await fetchRoster();
-
-        } catch (err: any) {
-            console.error("Error processing file:", err);
-            alert("Error: " + err.message);
-        } finally {
-            setIsProcessing(false);
-            if (fileInputRef.current) fileInputRef.current.value = '';
+        let workbook: XLSX.WorkBook;
+        if (isCsv) {
+          const text = String(e.target?.result ?? '');
+          workbook = XLSX.read(text, { type: 'string', raw: false });
+        } else {
+          workbook = XLSX.read(new Uint8Array(e.target?.result as ArrayBuffer), { type: 'array' });
         }
+
+        const dataRows: any[][] = [];
+        for (const sheetName of workbook.SheetNames) {
+          const ws = workbook.Sheets[sheetName];
+          const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as any[][];
+          for (let i = 1; i < rows.length; i++) {
+            dataRows.push(rows[i]);
+          }
+        }
+
+        const insertPayload: {
+          tournament_id: string;
+          first_name: string;
+          last_name: string;
+          country: string;
+          gender: string;
+          weight_category: string;
+          world_rank: number;
+        }[] = [];
+        let skippedNoName = 0;
+        let skippedCategory = 0;
+        const skipSamples: string[] = [];
+
+        const clean = (val: unknown) => (val !== undefined && val !== null && val !== '' ? String(val).trim() : '');
+
+        for (let ri = 0; ri < dataRows.length; ri++) {
+          const row = dataRows[ri];
+          if (!row || row.length === 0) continue;
+
+          const rankStr = clean(row[1]).replace('#', '');
+          const country = clean(row[4]) || 'UNK';
+          const firstName = clean(row[6]);
+          const lastName = clean(row[7]);
+          const genderRaw = clean(row[8]).toLowerCase();
+          const categoryRaw = clean(row[9]);
+
+          if (!firstName && !lastName) {
+            skippedNoName++;
+            continue;
+          }
+
+          const rank = parseInt(rankStr, 10) || 999;
+          const sex: 'Male' | 'Female' =
+            genderRaw.includes('f') || genderRaw === 'female' ? 'Female' : 'Male';
+
+          const canonical = resolveCanonicalWeightCategory(categoryRaw, sex, lookup);
+          if (!canonical) {
+            skippedCategory++;
+            if (skipSamples.length < 12) {
+              skipSamples.push(
+                `Row ~${ri + 2}: "${lastName}, ${firstName}" — category "${categoryRaw}" (${sex})`
+              );
+            }
+            continue;
+          }
+
+          insertPayload.push({
+            tournament_id: tournament.id,
+            first_name: firstName,
+            last_name: lastName,
+            country: country.toUpperCase(),
+            gender: sex,
+            weight_category: canonical,
+            world_rank: rank,
+          });
+        }
+
+        if (insertPayload.length === 0) {
+          const detail =
+            skipSamples.length > 0
+              ? `\n\nSkipped row examples:\n${skipSamples.slice(0, 8).join('\n')}`
+              : '';
+          alert(
+            `No athletes imported. Rows without name: ${skippedNoName}; category not in tournament: ${skippedCategory}.${detail}`
+          );
+          return;
+        }
+
+        const { error } = await supabase.from('tournament_roster').insert(insertPayload);
+        if (error) throw error;
+
+        const sampleNote =
+          skipSamples.length > 0
+            ? `\nSkipped row examples (category mismatch):\n${skipSamples.slice(0, 5).join('\n')}`
+            : '';
+        alert(
+          `Imported ${insertPayload.length} athletes (all worksheets in the workbook).` +
+            `\nSkipped: ${skippedNoName} without name; ${skippedCategory} with unrecognized category.${sampleNote}`
+        );
+        await fetchRoster();
+      } catch (err: any) {
+        console.error('Error processing file:', err);
+        alert('Error: ' + err.message);
+      } finally {
+        setIsProcessing(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
     };
-    reader.readAsArrayBuffer(file);
+
+    if (isCsv) {
+      reader.readAsText(file, 'UTF-8');
+    } else {
+      reader.readAsArrayBuffer(file);
+    }
   };
 
   const handleAddAthleteSubmit = async (e: React.FormEvent) => {
@@ -476,7 +521,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                             className="bg-purple-600 hover:bg-purple-700 text-white"
                             icon={GitMerge}
                         >
-                            Generar Brackets (Subir PDF)
+                            Generate Brackets (Upload PDF)
                         </Button>
                     </div>
                 )}
@@ -571,6 +616,11 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                             Add Athlete
                         </Button>
                     </div>
+                    <p className="text-[11px] text-slate-500 w-full xl:max-w-xl leading-relaxed">
+                      <span className="font-bold text-slate-600">Excel/CSV template (row 1 = header; all sheets are imported):</span>{' '}
+                      col B rank, E country, G first name, H last name, I gender (M/F), J weight category (e.g. -60kg or Men -60).
+                      Categories are matched flexibly to the tournament configuration.
+                    </p>
                 </div>
 
                 {/* Conditional Rendering for Empty State vs Roster Table */}

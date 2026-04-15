@@ -1,0 +1,19 @@
+---
+description: Keep CONFIG_PROTOCOL_README.md and CLAUDE.md in sync when docs or architecture change
+alwaysApply: true
+---
+
+# Documentation pairing (Tippon)
+
+When you change or document **architecture, routing, user flows, database schema, migrations, or scoring behavior**, update **both**:
+
+| File | Purpose |
+|------|---------|
+| `CONFIG_PROTOCOL_README.md` | Canonical detail: full schema, migrations, extended flows |
+| `CLAUDE.md` | Concise agent-oriented overview |
+
+**Incomplete work** if only one file is updated. Align facts and section intent between the two; avoid contradicting the other file.
+
+**Exceptions:** typos, purely cosmetic Markdown, or edits confined to unrelated files (e.g. `README.md` only) do not require dual updates unless they duplicate architecture facts.
+
+After substantive edits, skim the sibling file and add a matching bullet/paragraph if something new belongs in both.

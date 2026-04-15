@@ -87,7 +87,7 @@ const MatchCard: React.FC<MatchCardProps> = ({
           className={`flex items-center p-3 h-12 transition-colors ${isTop ? 'border-b border-slate-200' : ''} ${isDragTarget ? 'bg-blue-50 border-l-4 border-l-blue-400' : ''}`}
         >
           <span className={`text-sm italic ${isDragTarget ? 'text-blue-400 font-medium' : 'text-slate-300'}`}>
-            {isDragTarget ? 'Soltar aquí' : '---'}
+            {isDragTarget ? 'Drop here' : '---'}
           </span>
         </div>
       );
@@ -121,7 +121,9 @@ const MatchCard: React.FC<MatchCardProps> = ({
                <GripVertical size={14} />
             </div>
           )}
-          <span className="text-xs text-slate-400 w-5 font-medium">({competitor.rank || '-'})</span>
+          {competitor.rank != null && competitor.rank !== '' && competitor.rank !== 'UR' && (
+            <span className="text-xs text-slate-400 w-8 font-medium shrink-0">({competitor.rank})</span>
+          )}
           <Flag countryCode={competitor.country} className="w-5 h-3.5 shadow-sm" />
           <span className="text-sm font-semibold text-slate-800 truncate max-w-[120px]">
             {competitor.name}

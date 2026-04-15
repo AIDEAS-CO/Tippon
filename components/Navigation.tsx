@@ -34,7 +34,13 @@ const Navigation: React.FC<NavigationProps> = ({ currentView, onNavigate, userPr
           {/* Center Navigation */}
           <div className="flex gap-1">
             {navItems.map((item) => {
-              const isActive = currentView === item.id || (item.id === 'TOURNAMENTS' && (currentView === 'BRACKET' || currentView === 'CREATE_TOURNAMENT'));
+              const isActive =
+                currentView === item.id ||
+                (item.id === 'TOURNAMENTS' &&
+                  (currentView === 'BRACKET' ||
+                    currentView === 'MEDAL_TABLE_PICKS' ||
+                    currentView === 'TOURNAMENT_FINAL_RESULTS' ||
+                    currentView === 'CREATE_TOURNAMENT'));
               const Icon = item.icon;
               
               return (

@@ -32,11 +32,14 @@ const TournamentList: React.FC<TournamentListProps> = ({
       await Promise.all(
         tournaments.map(async (t) => {
           try {
-            const { count, error } = await supabase
+            const { data, error } = await supabase
               .from('user_picks')
-              .select('user_id', { count: 'exact', head: true })
+              .select('user_id')
               .eq('tournament_id', t.id);
-            if (!error) counts[t.id] = count || 0;
+            if (!error && data) {
+              const uniqueUsers = new Set(data.map((row: any) => row.user_id));
+              counts[t.id] = uniqueUsers.size;
+            }
           } catch { /* table may not exist */ }
         })
       );
@@ -73,24 +76,22 @@ const TournamentList: React.FC<TournamentListProps> = ({
       else onNavigate('CREATE_TOURNAMENT');
   };
 
-  // --- SPANISH DATE FORMATTER (Safe Parse) ---
+  // --- Date formatter (safe parse, avoids timezone shifts on date-only strings) ---
   const formatTournamentDate = (dateString: string | undefined) => {
-     if (!dateString) return 'Fecha TBD';
-     
-     // Tomamos solo la parte YYYY-MM-DD para evitar que JavaScript aplique zonas horarias
+     if (!dateString) return 'Date TBD';
+
      const parts = dateString.split('T')[0].split('-');
      const year = parseInt(parts[0], 10);
      const month = parseInt(parts[1], 10);
      const day = parseInt(parts[2], 10);
-     
-     // Creamos la fecha usando el constructor local (mes es 0-indexed, por eso -1)
+
      const date = new Date(year, month - 1, day);
-     
-     return date.toLocaleDateString('es-ES', { 
-       month: 'long', 
-       day: 'numeric', 
-       year: 'numeric' 
-     }).replace(/^\w/, (c) => c.toUpperCase());
+
+     return date.toLocaleDateString('en-US', {
+       month: 'long',
+       day: 'numeric',
+       year: 'numeric',
+     });
   };
 
   return (
@@ -171,29 +172,27 @@ const TournamentList: React.FC<TournamentListProps> = ({
                  {userRole === 'ADMIN' && (
                      <div className="absolute top-4 right-12 z-20 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                          {status === 'LIVE' || status === 'COMPLETED' ? (
-                            <div className="p-2 bg-slate-100 text-slate-400 rounded-lg cursor-not-allowed" title="Editing Locked">
+                            <div className="p-2 bg-slate-100 text-slate-400 rounded-lg cursor-not-allowed" title="Editing locked (tournament is active)">
                                 <Lock size={16} />
                             </div>
                          ) : (
-                            <>
-                              <Button 
-                                  variant="secondary"
-                                  onClick={(e) => handleEditClick(e, t)}
-                                  className="p-2 h-auto"
-                                  title="Edit Tournament Details"
-                              >
-                                  <Edit3 size={16} />
-                              </Button>
-                              <Button 
-                                  variant="danger"
-                                  onClick={(e) => handleDeleteClick(e, t)}
-                                  className="p-2 h-auto"
-                                  title="Delete Tournament"
-                              >
-                                  <Trash2 size={16} />
-                              </Button>
-                            </>
+                            <Button
+                                variant="secondary"
+                                onClick={(e) => handleEditClick(e, t)}
+                                className="p-2 h-auto"
+                                title="Edit Tournament"
+                            >
+                                <Edit3 size={16} />
+                            </Button>
                          )}
+                         <Button
+                             variant="danger"
+                             onClick={(e) => handleDeleteClick(e, t)}
+                             className="p-2 h-auto"
+                             title="Delete Tournament"
+                         >
+                             <Trash2 size={16} />
+                         </Button>
                      </div>
                  )}
 
@@ -215,6 +214,20 @@ const TournamentList: React.FC<TournamentListProps> = ({
                         </div>
                     </div>
                  </div>
+
+                 {status === 'COMPLETED' && (
+                   <button
+                     type="button"
+                     onClick={(e) => {
+                       e.stopPropagation();
+                       onSelectTournament(t);
+                       onNavigate('TOURNAMENT_FINAL_RESULTS');
+                     }}
+                     className="mt-3 w-full py-2.5 text-xs font-black uppercase tracking-wide text-indigo-700 border border-indigo-200 bg-indigo-50/80 rounded-lg hover:bg-indigo-100 transition-colors"
+                   >
+                     Final results
+                   </button>
+                 )}
              </div>
              );
          })}

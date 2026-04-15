@@ -13,6 +13,8 @@ import TournamentRoster from './pages/TournamentRoster';
 import AdminTournamentRoster from './components/TournamentRoster'; 
 import BuildBracket from './pages/BuildBracket';
 import TournamentResults from './pages/TournamentResults';
+import MedalTablePicks from './pages/MedalTablePicks';
+import TournamentFinalResults from './pages/TournamentFinalResults';
 import Leaderboard from './pages/Leaderboard';
 import Profile from './pages/Profile';
 import Navigation from './components/Navigation';
@@ -143,6 +145,8 @@ const App: React.FC = () => {
       } else if (event === 'SIGNED_OUT') {
         setCurrentView('LOGIN');
         setUserProfile(null);
+        // Clear picks state so the next user doesn't see the previous user's data
+        setAllUserPicks({});
       }
     });
 
@@ -183,6 +187,7 @@ const App: React.FC = () => {
 
       return {
           ...data,
+          id: String(data.id),
           date: data.start_date || data.date, // Robust mapping
           status: data.status ? data.status.toUpperCase() : 'UPCOMING',
           roster: finalRoster,
@@ -296,7 +301,8 @@ const App: React.FC = () => {
       if (freshDetails) {
           setDraftTournament(freshDetails);
       }
-      if (t.status === 'DRAFT' || t.status === 'UPCOMING') {
+      const status = (freshDetails?.status || t.status || '').toUpperCase();
+      if (status === 'DRAFT' || status === 'UPCOMING') {
          setCurrentView('CREATE_TOURNAMENT'); 
       } else {
          setCurrentView('BUILD_BRACKET');
@@ -339,17 +345,38 @@ const App: React.FC = () => {
   };
 
   const handleDeleteTournament = async (t: Tournament) => {
-    if (!confirm(`¿Estás seguro de eliminar "${t.name}"? Esta acción no se puede deshacer.`)) return;
+    if (!confirm(`Are you sure you want to delete "${t.name}"? This action cannot be undone.`)) return;
     try {
+      // Attempt to delete child rows explicitly (works when the admin owns them).
+      // Even if some fail silently due to RLS (e.g. other users' picks), the
+      // DB-level ON DELETE CASCADE (Migration 006) will clean them up automatically
+      // when the parent tournament row is deleted.
+      await supabase.from('tournament_scores').delete().eq('tournament_id', t.id);
+      await supabase.from('match_results').delete().eq('tournament_id', t.id);
+      await supabase.from('user_picks').delete().eq('tournament_id', t.id);
       await supabase.from('competition_brackets').delete().eq('tournament_id', t.id);
       await supabase.from('tournament_roster').delete().eq('tournament_id', t.id);
       await supabase.from('categories').delete().eq('tournament_id', t.id);
+
+      // This is the definitive delete — CASCADE handles any remaining child rows
       const { error } = await supabase.from('tournaments').delete().eq('id', t.id);
-      if (error) throw error;
+      if (error) {
+        // If we get a FK constraint error here it means Migration 006 has not been
+        // run yet in Supabase. Direct the admin to run it.
+        if (error.code === '23503') {
+          alert(
+            'Cannot delete this tournament because other users have picks saved for it.\n\n' +
+            'To fix this permanently, run Migration 006 in your Supabase Dashboard → SQL Editor.\n' +
+            'See CONFIG_PROTOCOL_README.md → Migrations → Migration 006.'
+          );
+          return;
+        }
+        throw error;
+      }
       setTournaments(prev => prev.filter(tour => tour.id !== t.id));
     } catch (err: any) {
       console.error("Error deleting tournament:", err);
-      alert("Error al eliminar: " + (err?.message || String(err)));
+      alert("Error deleting tournament: " + (err?.message || String(err)));
     }
   };
 
@@ -389,9 +416,10 @@ const App: React.FC = () => {
           setSelectedTournament(prev => prev ? { ...prev, completion } : null);
       }
 
-      // Fallback: Save to localStorage
+      // Fallback: Save to localStorage (key includes userId to prevent cross-user data leakage)
       try {
-          const storageKey = `tippon-picks-${tournamentId}-${category}`;
+          const uid = userProfile?.id || 'anon';
+          const storageKey = `tippon-picks-${uid}-${tournamentId}-${category}`;
           localStorage.setItem(storageKey, JSON.stringify(picks));
       } catch (e) {
           console.error("Failed to persist picks to localStorage:", e);
@@ -412,10 +440,10 @@ const App: React.FC = () => {
                   }, { onConflict: 'user_id,tournament_id,category' });
               
               if (error && error.code !== '42P01') { // 42P01 is relation does not exist
-                  console.error("Error guardando picks en DB:", error);
+                  console.error("Error saving picks to DB:", error);
               }
           } catch (dbErr) {
-              console.error("Error de DB en picks:", dbErr);
+              console.error("DB error saving picks:", dbErr);
           }
       }
   };
@@ -503,6 +531,15 @@ const App: React.FC = () => {
             userRole={userRole}
             onStatusChange={handleStatusChange}
         />;
+      case 'MEDAL_TABLE_PICKS':
+        return (
+          <MedalTablePicks
+            onNavigate={setCurrentView}
+            tournament={selectedTournament}
+            userId={userProfile?.id}
+            onSavePicks={handleSavePicks}
+          />
+        );
       case 'ROSTER':
           return <TournamentRoster 
               onNavigate={setCurrentView} 
@@ -532,6 +569,13 @@ const App: React.FC = () => {
             userStats={userStats}
             tournament={selectedTournament}
         />;
+      case 'TOURNAMENT_FINAL_RESULTS':
+        return (
+          <TournamentFinalResults
+            onNavigate={setCurrentView}
+            tournament={selectedTournament}
+          />
+        );
       case 'LEADERBOARD':
         return <Leaderboard onNavigate={setCurrentView} userStats={userStats} />;
       case 'PROFILE':

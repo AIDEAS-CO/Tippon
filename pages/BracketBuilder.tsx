@@ -245,7 +245,7 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
     setUploadError(null);
 
     try {
-        // 0. OBTENER CATEGORÍAS (Para mapear IDs correctamente)
+        // 0. GET CATEGORIES (to map IDs correctly)
         const { data: dbCategories, error: catError } = await supabase
             .from('categories')
             .select('*')
@@ -270,14 +270,14 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
 
         const judokasToSync = Array.from(uniqueJudokasMap.values());
 
-        console.log("Sincronizando tabla judokas...", judokasToSync.length);
+        console.log("Syncing judokas table...", judokasToSync.length);
         const { data: syncedJudokas, error: jError } = await supabase
             .from('judokas')
             .upsert(judokasToSync, { onConflict: 'full_name,country_code,gender' })
             .select('id, full_name');
 
         if (jError) throw jError;
-        console.log("Judokas sincronizados con éxito. Total devuelto:", syncedJudokas?.length);
+        console.log("Judokas synced successfully. Total returned:", syncedJudokas?.length);
 
         // 2. Limpiar participantes actuales del torneo
         console.log("Limpiando participantes previos del torneo:", tournament.id);
@@ -290,11 +290,11 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
             const participantsData = allCompetitors.map(comp => {
                 const foundJudoka = syncedJudokas.find(sj => sj.full_name === comp.name.trim());
                 if (!foundJudoka) {
-                    console.warn(`No se encontró ID para judoka: ${comp.name}`);
+                    console.warn(`No ID found for judoka: ${comp.name}`);
                     return null;
                 }
 
-                // LÓGICA CLAVE: Buscar la categoría correcta
+                // KEY LOGIC: Find the correct category
                 const compGenderFull = comp.sex === 'M' ? 'Male' : 'Female';
                 // Aseguramos que el peso tenga 'kg' si la DB lo usa (asumimos que la DB usa formato '-60kg')
                 let compWeightNormalized = String(comp.weight || '').trim();
@@ -322,9 +322,9 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
             }
         }
 
-        // 4. Actualizar estado y roster en la tabla tournaments
+        // 4. Update tournaments row with roster and status
         const dbStatus = newStatus.toLowerCase();
-        console.log("Actualizando tabla tournaments con roster y status:", dbStatus);
+        console.log("Updating tournaments table with roster and status:", dbStatus);
         
         const { error: tError } = await supabase
             .from('tournaments')
@@ -337,11 +337,11 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
 
         if (tError) throw tError;
 
-        console.log("¡Guardado completo exitosamente!");
+        console.log("Saved successfully!");
         
-        // Alert explícito como solicitado para confirmación visual de depuración
+        // Explicit alert as requested for visual debug confirmation
         if (dbStatus === 'draft') {
-            alert("¡Guardado completo! Borrador y categorías actualizados.");
+            alert("Saved successfully! Draft and categories updated.");
         }
 
         // UI Feedback Logic
@@ -369,8 +369,8 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
         }
 
     } catch (err: any) {
-        console.error("ERROR CRÍTICO EN GUARDADO:", err);
-        alert("Error crítico al guardar: " + (err.message || JSON.stringify(err)));
+        console.error("CRITICAL SAVE ERROR:", err);
+        alert("Critical save error: " + (err.message || JSON.stringify(err)));
         setUploadError("Error saving to database: " + err.message);
     } finally {
         setUploadState('idle');

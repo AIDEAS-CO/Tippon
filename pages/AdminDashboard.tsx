@@ -45,24 +45,23 @@ const DEFAULT_SCORING_RULES: ScoringRule[] = [
     // Zusatztipp (Additional Pick)
     { id: 'additional_pick_top7', label: 'Top 7 Pick', description: 'Chosen athlete finishes in Top 7.', defaultPoints: 2, enabled: true, icon: List, color: 'text-blue-600', bgColor: 'bg-blue-50' },
 
-    // Pool Finals
-    { id: 'pool_finals_2', label: '2 Correct Winners', description: 'Correctly predict both pool final winners.', defaultPoints: 2, enabled: true, icon: LayoutGrid, color: 'text-yellow-600', bgColor: 'bg-yellow-50' },
-    { id: 'pool_finals_1', label: '1 Correct Winner', description: 'Correctly predict one pool final winner.', defaultPoints: 1, enabled: true, icon: LayoutGrid, color: 'text-yellow-600', bgColor: 'bg-yellow-50' },
+    // Pool Finals — 1 pt per correct QF participant (out of 8 per category)
+    { id: 'pool_finals_per_correct', label: 'Per Correct QF Athlete', description: '1 point for each of the 8 QF participants correctly predicted (order doesn\'t matter).', defaultPoints: 1, enabled: true, icon: LayoutGrid, color: 'text-yellow-600', bgColor: 'bg-yellow-50' },
 
     // Medal Table
-    { id: 'medal_table_exact', label: 'Exact Count', description: 'Exact prediction of medals.', defaultPoints: 4, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
-    { id: 'medal_table_dev1', label: 'Deviation 1', description: 'Off by 1 medal.', defaultPoints: 3, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
-    { id: 'medal_table_dev2', label: 'Deviation 2', description: 'Off by 2 medals.', defaultPoints: 2, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
-    { id: 'medal_table_dev3', label: 'Deviation 3', description: 'Off by 3 medals.', defaultPoints: 1, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+    { id: 'medal_table_exact', label: 'Exact Ranking', description: 'Country is at the exact predicted ranking position.', defaultPoints: 4, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+    { id: 'medal_table_dev1', label: 'Deviation 1', description: 'Country ranking off by 1 position.', defaultPoints: 3, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+    { id: 'medal_table_dev2', label: 'Deviation 2', description: 'Country ranking off by 2 positions.', defaultPoints: 2, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
+    { id: 'medal_table_dev3', label: 'Deviation 3', description: 'Country ranking off by 3 positions.', defaultPoints: 1, enabled: true, icon: Flag, color: 'text-emerald-600', bgColor: 'bg-emerald-50' },
 
     // Bonuses
-    { id: 'bonus_perfect_weight', label: 'Perfect Weight Category', description: 'Flawless prediction for category.', defaultPoints: 10, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
-    { id: 'bonus_majority_champs', label: 'Majority of Champions', description: '>50% of world champions correct.', defaultPoints: 8, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
-    { id: 'bonus_10_additional', label: '10 Additional Picks', description: '10 correct additional picks.', defaultPoints: 6, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
-    { id: 'bonus_all_pools', label: 'All Pool Finals', description: 'All pool finals correct.', defaultPoints: 5, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' }
+    { id: 'bonus_perfect_weight', label: 'Perfect Weight Category', description: 'All 4 medalists (Gold, Silver, Bronze x2) exactly correct in one category.', defaultPoints: 10, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
+    { id: 'bonus_majority_champs', label: 'Majority of Champions', description: 'More than 50% of Gold medal predictions correct across all categories.', defaultPoints: 8, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
+    { id: 'bonus_10_additional', label: '10 Additional Picks', description: '10 or more additional (Zusatztipp) picks correct across all categories.', defaultPoints: 6, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' },
+    { id: 'bonus_all_pools', label: 'All QF Athletes', description: 'All 8 QF participants correct in every category.', defaultPoints: 5, enabled: true, icon: Star, color: 'text-purple-600', bgColor: 'bg-purple-50' }
 ];
 
-// Definición de las Categorías y qué reglas contienen
+// Rule groups: which rules belong to each scoring category
 const RULE_GROUPS = [
   {
     id: 'group_1st_2nd',
@@ -90,11 +89,11 @@ const RULE_GROUPS = [
   },
   {
     id: 'group_pool',
-    title: 'Pool Finals',
+    title: 'Pool Finals (QF)',
     icon: LayoutGrid,
     color: 'text-yellow-600',
     bgColor: 'bg-yellow-50',
-    ruleIds: ['pool_finals_2', 'pool_finals_1']
+    ruleIds: ['pool_finals_per_correct']
   },
   {
     id: 'group_medal',
@@ -161,6 +160,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       selectedMaleWeights: string[];
       selectedFemaleWeights: string[];
       scoringRules: ScoringRule[];
+      hasRepechage: boolean;
   }>({
       name: initialData?.name || '',
       date: formatDateForInput(initialData?.start_date),
@@ -171,9 +171,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       // LOGIC: If editing, use saved weights. If creating, default to ALL weights.
       selectedMaleWeights: isEditing ? (initialData?.categories?.male || []) : MALE_WEIGHTS,
       selectedFemaleWeights: isEditing ? (initialData?.categories?.female || []) : FEMALE_WEIGHTS,
-      scoringRules: initialData?.scoring_configuration 
-          ? mergeScoringConfig(initialData.scoring_configuration) 
-          : DEFAULT_SCORING_RULES
+      scoringRules: initialData?.scoring_configuration
+          ? mergeScoringConfig(initialData.scoring_configuration)
+          : DEFAULT_SCORING_RULES,
+      hasRepechage: initialData?.scoring_configuration?.has_repechage ?? false,
   });
 
   // --- PERSISTENCE: Re-sync on initialData change ---
@@ -188,9 +189,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
             femaleSelected: initialData.categories?.female?.length > 0,
             selectedMaleWeights: initialData.categories?.male || [],
             selectedFemaleWeights: initialData.categories?.female || [],
-            scoringRules: initialData.scoring_configuration 
-                ? mergeScoringConfig(initialData.scoring_configuration) 
-                : prev.scoringRules
+            scoringRules: initialData.scoring_configuration
+                ? mergeScoringConfig(initialData.scoring_configuration)
+                : prev.scoringRules,
+            hasRepechage: initialData.scoring_configuration?.has_repechage ?? prev.hasRepechage,
         }));
     }
   }, [initialData]);
@@ -344,6 +346,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
             if (rule.enabled) acc[rule.id] = rule.defaultPoints;
             return acc;
         }, {} as any);
+        scoringConfig.has_repechage = formData.hasRepechage;
 
         const { error } = await supabase
             .from('tournaments')
@@ -590,6 +593,27 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                       </div>
                   );
               })}
+          </div>
+
+          {/* Repechage Toggle */}
+          <div className="mt-6 bg-white rounded-xl shadow-zen border border-slate-200 p-5">
+              <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-4">
+                      <div className="p-2.5 rounded-lg bg-orange-50 text-orange-600">
+                          <Award size={20} />
+                      </div>
+                      <div>
+                          <span className="font-bold text-lg text-slate-900">Repechage Bracket</span>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                              IJF quarter-final repechage with 2 bronze medal matches (cross-over system).
+                          </p>
+                      </div>
+                  </div>
+                  <Switch
+                      checked={formData.hasRepechage}
+                      onChange={() => setFormData(prev => ({ ...prev, hasRepechage: !prev.hasRepechage }))}
+                  />
+              </div>
           </div>
 
           <div className="mt-8 flex justify-between items-center sticky bottom-4 bg-white/80 backdrop-blur-md p-4 rounded-xl border border-slate-200 shadow-2xl z-20">
