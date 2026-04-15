@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { ViewState, Tournament, Competitor } from '../types';
-import { UserPlus, Filter, Search, ChevronLeft, Save, User, Upload, Loader2, X, Plus, Users, Globe, Scale, Trophy, ChevronDown, CheckCircle, GitMerge } from 'lucide-react';
+import { UserPlus, Filter, Search, ChevronLeft, Save, User, Upload, Loader2, X, Plus, Users, Globe, Scale, Trophy, ChevronDown, CheckCircle, GitMerge, Trash2 } from 'lucide-react';
 import Button from './ui/Button';
 import Flag from './ui/Flag';
 import { supabase } from '../lib/supabaseClient';
@@ -323,6 +323,20 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
           alert('Error adding athlete: ' + err.message);
       } finally {
           setIsProcessing(false);
+      }
+  };
+
+  const handleDeleteAthlete = async (athleteId: string, athleteName: string) => {
+      if (!confirm(`Remove "${athleteName}" from the roster?`)) return;
+      try {
+          const { error } = await supabase
+              .from('tournament_roster')
+              .delete()
+              .eq('id', athleteId);
+          if (error) throw error;
+          await fetchRoster();
+      } catch (err: any) {
+          alert('Error deleting athlete: ' + err.message);
       }
   };
 
@@ -650,6 +664,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                                     <th className="px-6 py-4">Country</th>
                                     <th className="px-6 py-4 text-center">Gender</th>
                                     <th className="px-6 py-4 text-center">Weight Category</th>
+                                    <th className="px-4 py-4 w-12"></th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-100 text-sm text-slate-700">
@@ -687,6 +702,15 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                                             </td>
                                             <td className="px-6 py-4 text-center font-bold text-slate-800">
                                                 {competitor.weight}
+                                            </td>
+                                            <td className="px-4 py-4 text-center">
+                                                <button
+                                                    onClick={() => handleDeleteAthlete(competitor.id, competitor.name)}
+                                                    className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                                                    title="Remove athlete"
+                                                >
+                                                    <Trash2 size={15} />
+                                                </button>
                                             </td>
                                         </tr>
                                     ))

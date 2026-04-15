@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Loader2 } from 'lucide-react';
 import Login from './pages/Login';
 import ForgotPassword from './pages/ForgotPassword';
@@ -24,6 +24,7 @@ import { supabase } from './lib/supabaseClient';
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewState>('LOGIN');
   const [isAuthChecking, setIsAuthChecking] = useState(true);
+  const hasInitialSession = useRef(false);
   
   // GLOBAL TOURNAMENT STATE
   const [tournaments, setTournaments] = useState<Tournament[]>([]);
@@ -117,6 +118,7 @@ const App: React.FC = () => {
     const initSession = async () => {
         const { data: { session } } = await supabase.auth.getSession();
         if (session) {
+            hasInitialSession.current = true;
             setCurrentView('HOME');
             refreshProfile(session.user);
         }
@@ -128,21 +130,17 @@ const App: React.FC = () => {
       if (event === 'PASSWORD_RECOVERY') {
         setCurrentView('UPDATE_PASSWORD');
       } else if (event === 'SIGNED_IN' && session) {
-        // If we are already in UPDATE_PASSWORD, don't redirect to HOME
-        // But we can't easily check currentView here because of closure staleness unless we use a ref or functional update, 
-        // but setState is async.
-        // However, usually PASSWORD_RECOVERY fires. 
-        // Let's just set HOME for SIGNED_IN, and if PASSWORD_RECOVERY fires it will override.
-        // But if SIGNED_IN fires AFTER, it will override PASSWORD_RECOVERY.
-        // A common pattern is to check if the URL has type=recovery.
-        
-        // Let's check the URL hash for type=recovery
         const isRecovery = window.location.hash && window.location.hash.includes('type=recovery');
-        if (!isRecovery) {
+        // Only redirect to HOME on the very first sign-in.
+        // Supabase also fires SIGNED_IN on token refreshes (e.g. when switching back to this tab),
+        // which would kick the user out of whatever view they were on.
+        if (!isRecovery && !hasInitialSession.current) {
             setCurrentView('HOME');
         }
+        hasInitialSession.current = true;
         refreshProfile(session.user);
       } else if (event === 'SIGNED_OUT') {
+        hasInitialSession.current = false;
         setCurrentView('LOGIN');
         setUserProfile(null);
         // Clear picks state so the next user doesn't see the previous user's data

@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ViewState, Tournament } from '../types';
-import { ArrowLeft, Save, FileUp, CheckCircle, Upload, Loader2 } from 'lucide-react';
+import { ArrowLeft, Save, FileUp, CheckCircle, Upload, Loader2, X, Plus, Trash2, ArrowLeftRight, ChevronDown, AlertTriangle, PenLine } from 'lucide-react';
 import Flag from '../components/ui/Flag';
 import Button from '../components/ui/Button';
 import { supabase } from '../lib/supabaseClient';
@@ -13,13 +13,31 @@ interface BuildBracketProps {
 
 import { GoogleGenAI, Type } from '@google/genai';
 
+// --- Types ---
+interface ExtractedCompetitor {
+  name: string;
+  country: string;
+}
+
+interface ExtractedMatch {
+  matchNumber: number;
+  competitor1: ExtractedCompetitor | null;
+  competitor2: ExtractedCompetitor | null;
+}
+
+interface ExtractedCategory {
+  weight: string;
+  participantCount: number;
+  matches: ExtractedMatch[];
+}
+
+// --- PDF helpers ---
 const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.readAsDataURL(file);
     reader.onload = () => {
       const result = reader.result as string;
-      // Remove the data:application/pdf;base64, prefix
       const base64 = result.split(',')[1];
       resolve(base64);
     };
@@ -27,19 +45,26 @@ const fileToBase64 = (file: File): Promise<string> => {
   });
 };
 
-const extractBracketFromPDF = async (file: File, roster: any[]) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is missing. Add it to .env.local and restart the server.");
+const buildGeminiPrompt = (singleCategory?: string) => {
+  if (singleCategory) {
+    return `Extract the tournament bracket from this Judo draw PDF.
+This PDF contains ONLY the weight category: ${singleCategory}. All matches belong to this single category.
+Return a JSON array with exactly ONE object representing this weight category.
+Provide the 'weight' (e.g., '${singleCategory}') and an array of 'matches' for the FIRST ROUND ONLY.
+The matches MUST be in the exact visual order they appear in the PDF (top to bottom, Pool A, then B, then C, then D).
+
+CRITICAL RULES:
+- Set 'weight' to exactly: "${singleCategory}"
+- If the category header shows a participant count in parentheses (e.g. "Seniors (32)"), set 'participant_count' to that integer.
+- For each first-round match, include 'pdf_match_number' as the small integer printed next to that match (1, 2, 3, ...).
+- Each match has 'competitor1' (top athlete) and 'competitor2' (bottom athlete). Either may be null for a BYE.
+- If a competitor has a BYE, 'competitor2' MUST be null. Do NOT duplicate competitor1 into competitor2.
+- Extract 'name' (LAST NAME First Name) and 'country' (3-letter IOC code).
+- Extract EVERY first-round match, including those with empty slots.
+- Do not hallucinate matches or competitors. Only extract what is visible.`;
   }
 
-  const ai = new GoogleGenAI({ apiKey });
-
-  console.log("[Draw Reader] Converting PDF to base64...");
-  const base64Data = await fileToBase64(file);
-  console.log(`[Draw Reader] PDF converted (${(base64Data.length / 1024 / 1024).toFixed(2)} MB base64)`);
-
-  const prompt = `Extract the tournament bracket from this Judo draw PDF.
+  return `Extract the tournament bracket from this Judo draw PDF.
 Return a JSON array of objects, where each object represents a weight category found in the PDF.
 For each weight category, provide the 'weight' (e.g., '-100kg') and an array of 'matches' for the FIRST ROUND ONLY.
 The matches MUST be in the exact visual order they appear in the PDF (top to bottom, which corresponds to Pool A, then B, then C, then D).
@@ -54,6 +79,21 @@ CRITICAL RULES:
 - For each competitor, extract their 'name' (LAST NAME First Name) and 'country' (3-letter IOC code: e.g. BRN=Bahrain, BRA=Brazil — never confuse similar codes).
 - Extract EVERY first-round match shown in the draw, including matches with empty slots. Do not skip the last match in a pool.
 - Do not hallucinate matches or competitors. Only extract what is visible in the PDF.`;
+};
+
+const extractBracketFromPDF = async (file: File, singleCategory?: string) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is missing. Add it to .env.local and restart the server.");
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
+
+  console.log("[Draw Reader] Converting PDF to base64...");
+  const base64Data = await fileToBase64(file);
+  console.log(`[Draw Reader] PDF converted (${(base64Data.length / 1024 / 1024).toFixed(2)} MB base64)`);
+
+  const prompt = buildGeminiPrompt(singleCategory);
 
   const models = ["gemini-2.5-flash-lite"];
   const maxRetries = 3;
@@ -119,7 +159,6 @@ CRITICAL RULES:
 
         const responseText = response.text;
         if (!responseText) {
-          console.error("[Draw Reader] Empty response from Gemini:", response);
           throw new Error("Gemini returned an empty response. Try a different PDF.");
         }
 
@@ -143,17 +182,12 @@ CRITICAL RULES:
         }
       }
     }
-    console.log(`[Draw Reader] Model ${model} exhausted retries, trying next model...`);
   }
 
   throw lastError || new Error("Could not connect to the Gemini API after multiple attempts.");
 };
 
-/**
- * Pad R1 to a full single-elimination field: participant count is rounded up to 2^n
- * (same as UI bracket). Match slots 1..N; empty slots get null competitors.
- */
-function padAndOrderR1Matches(categoryData: any): any[] {
+function padAndOrderR1Matches(categoryData: any): ExtractedMatch[] {
   const raw: any[] = [...(categoryData.matches || [])];
   const pcRaw = categoryData.participant_count ?? categoryData.participants;
   const participantCount =
@@ -175,7 +209,13 @@ function padAndOrderR1Matches(categoryData: any): any[] {
   const bracketFieldSize = getBracketParticipantCount(athleteTarget);
   const expectedR1 = bracketFieldSize / 2;
 
-  if (expectedR1 <= 0) return raw;
+  if (expectedR1 <= 0) {
+    return raw.map((m, i) => ({
+      matchNumber: i + 1,
+      competitor1: m.competitor1 ? { name: m.competitor1.name, country: m.competitor1.country } : null,
+      competitor2: m.competitor2 ? { name: m.competitor2.name, country: m.competitor2.country } : null,
+    }));
+  }
 
   const bySlot = new Map<number, any>();
   raw.forEach((m, i) => {
@@ -186,150 +226,144 @@ function padAndOrderR1Matches(categoryData: any): any[] {
     if (!bySlot.has(slot)) bySlot.set(slot, m);
   });
 
-  const out: any[] = [];
+  const out: ExtractedMatch[] = [];
   for (let slot = 1; slot <= expectedR1; slot++) {
     const existing = bySlot.get(slot);
     if (existing) {
-      out.push({ ...existing, pdf_match_number: slot });
+      const c1 = existing.competitor1 ? { name: existing.competitor1.name, country: existing.competitor1.country } : null;
+      let c2 = existing.competitor2 ? { name: existing.competitor2.name, country: existing.competitor2.country } : null;
+      // Deduplicate: if both slots same athlete, set c2 to null
+      if (c1 && c2 && c1.name === c2.name && c1.country === c2.country) c2 = null;
+      out.push({ matchNumber: slot, competitor1: c1, competitor2: c2 });
     } else {
-      out.push({
-        pdf_match_number: slot,
-        competitor1: null,
-        competitor2: null,
-      });
+      out.push({ matchNumber: slot, competitor1: null, competitor2: null });
     }
   }
   return out;
 }
 
-// Mock Data from PDF
-const mockPoolA = [
-  { id: 1, name: 'BEKAURI Lasha', country: 'GEO' },
-  { id: 2, name: 'CRET Alex', country: 'ROU' },
-  { id: 3, name: 'BOBONOV Davlat', country: 'UZB' },
-  { id: 4, name: 'GRIGORIAN Aram', country: 'UAE' },
-  { id: 5, name: 'VARAPAYEU Yahor', country: 'BLR' },
-  { id: 6, name: 'NYZHNYK Oleksandr', country: 'USA' },
-  { id: 7, name: 'KIM Jonghoon', country: 'KOR' },
-  { id: 8, name: 'SONG Jiaze', country: 'CHN' },
-];
-const mockPoolB = [
-  { id: 9, name: 'FRONCKOWIAK Marcelo', country: 'BRA' },
-  { id: 10, name: 'SIVAN Roy', country: 'ISR' },
-  { id: 11, name: 'RASULOV Umar', country: 'TJK' },
-  { id: 12, name: 'ALLABERDIEV Ramazon', country: 'UZB' },
-  { id: 13, name: 'JABNIASHVILI Giorgi', country: 'GEO' },
-  { id: 14, name: 'TSECHOEV Adam', country: 'RUS' },
-  { id: 15, name: 'OKADA Riku', country: 'JPN' },
-  { id: 16, name: 'NINGTHOUJAM Sheetal Singh', country: 'IND' },
-];
-const mockPoolC = [
-  { id: 17, name: 'MACEDO Rafael', country: 'BRA' },
-  { id: 18, name: 'ABAZOV Astemir', country: 'RUS' },
-  { id: 19, name: 'MELISOV Daniiar', country: 'KGZ' },
-  { id: 20, name: 'ARKABAY Barak', country: 'KAZ' },
-  { id: 21, name: 'FATIYEV Murad', country: 'AZE' },
-  { id: 22, name: 'VISAN Vlad', country: 'ROU' },
-  { id: 23, name: 'BOZOROV Umar', country: 'UZB' },
-  { id: 24, name: 'KAWABATA Komei', country: 'JPN' },
-];
-const mockPoolD = [
-  { id: 25, name: 'TSELIDIS Theodoros', country: 'GRE' },
-  { id: 26, name: 'KARIMZODA Muzamir', country: 'TJK' },
-  { id: 27, name: 'SIDORYK Aliaksandr', country: 'BLR' },
-  { id: 28, name: 'LENZ Johann', country: 'GER' },
-  { id: 29, name: 'SHARIPOV Shakhzodxuja', country: 'UZB' },
-  { id: 30, name: 'IVANOV Ivaylo', country: 'BUL' },
-  { id: 31, name: 'BU Hebilige', country: 'CHN' },
-  { id: 32, name: 'SONG Minki', country: 'KOR' },
-];
+// --- Per-category upload state ---
+interface CategoryUploadState {
+  file: File | null;
+  status: 'idle' | 'processing' | 'done' | 'error';
+  error?: string;
+}
 
-const PoolBlock = ({ name, athletes, colorClass, startMatchNum }: any) => (
-  <div className="flex mb-6 relative w-80">
-    <div className={`w-8 flex items-center justify-center rounded-l-lg border border-r-0 border-slate-400 ${colorClass}`}>
-      <span className="transform -rotate-90 font-black tracking-widest text-sm whitespace-nowrap">{name}</span>
-    </div>
-    <div className="flex-1 bg-white rounded-r-lg border border-slate-400 flex flex-col">
-      {Array.from({ length: 4 }).map((_, pairIndex) => {
-        const a1 = athletes[pairIndex * 2];
-        const a2 = athletes[pairIndex * 2 + 1];
-        const matchNum = startMatchNum + pairIndex;
-        return (
-          <div key={pairIndex} className={`flex relative ${pairIndex !== 3 ? 'border-b-2 border-slate-400' : ''}`}>
-            <div className="flex-1">
-              <div className="flex items-center px-3 py-1.5 border-b border-slate-200 h-8">
-                <Flag countryCode={a1.country} className="mr-2 w-5 h-3.5" />
-                <span className="font-bold flex-1 text-xs truncate">{a1.name}</span>
-                <span className="text-slate-500 text-[10px] font-mono ml-2">{a1.country}</span>
-              </div>
-              <div className="flex items-center px-3 py-1.5 h-8 bg-slate-50">
-                <Flag countryCode={a2.country} className="mr-2 w-5 h-3.5" />
-                <span className="font-bold flex-1 text-xs truncate">{a2.name}</span>
-                <span className="text-slate-500 text-[10px] font-mono ml-2">{a2.country}</span>
-              </div>
-            </div>
-            {/* Match Number Circle */}
-            <div className="absolute -right-3 top-1/2 -translate-y-1/2 bg-slate-100 border border-slate-400 rounded-full w-6 h-6 flex items-center justify-center text-[10px] font-bold text-slate-600 z-10">
-              {matchNum}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  </div>
+// --- Review UI helpers ---
+const CountryInput: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}> = ({ value, onChange, placeholder = 'XXX' }) => (
+  <input
+    type="text"
+    maxLength={3}
+    value={value}
+    onChange={e => onChange(e.target.value.toUpperCase())}
+    placeholder={placeholder}
+    className="w-14 px-1.5 py-1 text-xs font-mono border border-slate-200 rounded focus:outline-none focus:border-blue-400 bg-white uppercase text-center"
+  />
 );
 
-const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) => {
-  const [file, setFile] = useState<File | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [showPreview, setShowPreview] = useState(false);
+const NameInput: React.FC<{
+  value: string;
+  onChange: (v: string) => void;
+}> = ({ value, onChange }) => (
+  <input
+    type="text"
+    value={value}
+    onChange={e => onChange(e.target.value)}
+    placeholder="LAST First"
+    className="flex-1 min-w-0 px-2 py-1 text-xs border border-slate-200 rounded focus:outline-none focus:border-blue-400 bg-white"
+  />
+);
 
-  const handleProcessPDF = async () => {
-    if (!file) return alert("Please upload a PDF first.");
+// --- Main component ---
+const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) => {
+  // Upload modes: 'single' = one PDF for all categories, 'per-category' = one PDF per category, 'manual' = no PDF
+  const [uploadMode, setUploadMode] = useState<'single' | 'per-category' | 'manual'>('single');
+
+  // Single PDF mode
+  const [singleFile, setSingleFile] = useState<File | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  // Per-category mode
+  const [categoryUploads, setCategoryUploads] = useState<Record<string, CategoryUploadState>>({});
+
+  // Review mode
+  const [mode, setMode] = useState<'upload' | 'review'>('upload');
+  const [extractedCategories, setExtractedCategories] = useState<ExtractedCategory[]>([]);
+  const [selectedReviewCategory, setSelectedReviewCategory] = useState<string>('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Manual mode roster
+  const [rosterByCategory, setRosterByCategory] = useState<Record<string, { name: string; country: string }[]>>({});
+  const [selectedManualCategory, setSelectedManualCategory] = useState<string>('');
+
+  const allConfiguredCategories = [
+    ...(tournament?.categories?.male || []).map(w => ({ weight: w, gender: 'Male' })),
+    ...(tournament?.categories?.female || []).map(w => ({ weight: w, gender: 'Female' })),
+  ];
+
+  // Initialize per-category upload state when tournament loads
+  useEffect(() => {
+    if (allConfiguredCategories.length > 0) {
+      const init: Record<string, CategoryUploadState> = {};
+      allConfiguredCategories.forEach(c => {
+        init[c.weight] = { file: null, status: 'idle' };
+      });
+      setCategoryUploads(prev => {
+        const merged = { ...init };
+        Object.keys(prev).forEach(k => { if (merged[k]) merged[k] = prev[k]; });
+        return merged;
+      });
+    }
+  }, [tournament?.id]);
+
+  // Set initial manual category
+  useEffect(() => {
+    if (allConfiguredCategories.length > 0 && !selectedManualCategory) {
+      setSelectedManualCategory(allConfiguredCategories[0].weight);
+    }
+  }, [tournament?.id]);
+
+  // Fetch roster for manual mode
+  useEffect(() => {
+    if (uploadMode !== 'manual' || !tournament?.id) return;
+    const fetchRoster = async () => {
+      const { data } = await supabase
+        .from('tournament_roster')
+        .select('first_name, last_name, country, weight_category')
+        .eq('tournament_id', tournament.id);
+      if (!data) return;
+      const grouped: Record<string, { name: string; country: string }[]> = {};
+      data.forEach((r: any) => {
+        const w = r.weight_category;
+        if (!grouped[w]) grouped[w] = [];
+        grouped[w].push({ name: `${r.last_name} ${r.first_name}`.trim(), country: r.country });
+      });
+      setRosterByCategory(grouped);
+    };
+    fetchRoster();
+  }, [uploadMode, tournament?.id]);
+
+  // --- Process single PDF ---
+  const handleProcessSinglePDF = async () => {
+    if (!singleFile) return alert("Please upload a PDF first.");
     if (!tournament) return alert("No tournament selected.");
-    
+
     setIsProcessing(true);
-    
     try {
-      // Coerce to integer — FK failures happen if id is missing, wrong type, or tournament was deleted
       const tournamentIdNum = parseInt(String(tournament.id), 10);
       if (!Number.isFinite(tournamentIdNum) || tournamentIdNum <= 0) {
-        alert(
-          'This event has no valid database ID. Open Tournaments, select your event again, then use "Generate Brackets" from the roster (or the bracket build step) so the app loads a saved tournament.'
-        );
+        alert('Invalid tournament ID. Select the tournament again and retry.');
         return;
       }
 
-      const { data: tournamentRow, error: tournamentLookupError } = await supabase
-        .from('tournaments')
-        .select('id')
-        .eq('id', tournamentIdNum)
-        .maybeSingle();
+      console.log("[Draw Reader] Extracting brackets from PDF with Gemini...");
+      const extractedData = await extractBracketFromPDF(singleFile);
 
-      if (tournamentLookupError) {
-        console.error('[Draw Reader] Tournament lookup failed:', tournamentLookupError);
-        alert(
-          'Could not verify this tournament: ' + tournamentLookupError.message +
-            '\n\nIf you use row-level security, ensure authenticated users can SELECT from `tournaments`.'
-        );
-        return;
-      }
-      if (!tournamentRow) {
-        alert(
-          'This tournament was not found in the database. It may have been deleted, or the page is out of date.\n\nRefresh the app, open the tournament from the list again, then upload the Draw PDF.'
-        );
-        return;
-      }
-
-      console.log("[Draw Reader] Step 1: Extracting brackets from PDF with Gemini...");
-      const extractedData = await extractBracketFromPDF(file, []);
-      console.log("[Draw Reader] Data extracted:", extractedData?.length, "categories");
-
-      // Filter: only import categories configured for this tournament
-      const configuredWeights = [
-        ...(tournament.categories?.male || []),
-        ...(tournament.categories?.female || []),
-      ];
+      const configuredWeights = allConfiguredCategories.map(c => c.weight);
       const normalizeWeight = (s: string) =>
         s.toLowerCase().replace(/\s+/g, '').replace(/^(men'?s?|women'?s?|male|female)/i, '');
 
@@ -345,248 +379,592 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
       if (filteredData.length === 0) {
         const pdfCats = extractedData.map((c: any) => c.weight).join(', ');
         const confCats = configuredWeights.join(', ');
-        alert(`No matching categories found.\nPDF has: ${pdfCats}\nTournament expects: ${confCats}\nCheck that the correct Draw PDF was uploaded.`);
+        alert(`No matching categories found.\nPDF has: ${pdfCats}\nTournament expects: ${confCats}`);
         return;
       }
 
-      console.log(`[Draw Reader] Filtered to ${filteredData.length}/${extractedData.length} configured categories`);
+      const categories: ExtractedCategory[] = filteredData.map((cat: any) => ({
+        weight: cat.weight,
+        participantCount: cat.participant_count || 0,
+        matches: padAndOrderR1Matches(cat),
+      }));
 
-      const matchesToInsert: any[] = [];
-
-      for (const categoryData of filteredData) {
-        const weight = categoryData.weight;
-        const matches = padAndOrderR1Matches(categoryData);
-        /** Per-category display index: R1 = 1..N, then next category starts at 1 again in the UI (stored as match_number per row within category). */
-        let categoryMatchIndex = 1;
-
-        console.log(
-          `[Draw Reader]   Category: "${weight}" | ${matches.length} R1 rows (after pad/order; raw had ${(categoryData.matches || []).length})`
-        );
-
-        for (const match of matches) {
-          const c1 = match.competitor1 || null;
-          let c2 = match.competitor2 || null;
-
-          if (c1 && c2 && c1.name === c2.name && c1.country === c2.country) {
-            c2 = null;
-          }
-
-          matchesToInsert.push({
-            tournament_id: tournamentIdNum,
-            match_number: categoryMatchIndex++,
-            weight_category: weight,
-            competitor_1: null,
-            competitor_2: null,
-            bracket_data: {
-              competitor1: c1 ? { name: c1.name, country: c1.country } : null,
-              competitor2: c2 ? { name: c2.name, country: c2.country } : null,
-            },
-          });
-        }
-      }
-
-      console.log(`[Draw Reader] Step 2: Saving ${matchesToInsert.length} matches to Supabase...`);
-
-      if (matchesToInsert.length > 0) {
-        await supabase.from('competition_brackets').delete().eq('tournament_id', tournamentIdNum);
-        const { error: insertError } = await supabase.from('competition_brackets').insert(matchesToInsert);
-        if (insertError) throw insertError;
-      }
-
-      console.log("[Draw Reader] Step 3: Updating tournament status...");
-      await supabase.from('tournaments').update({ status: 'upcoming' }).eq('id', tournamentIdNum);
-
-      console.log("[Draw Reader] Complete!");
-      alert(`Brackets generated! ${matchesToInsert.length} matches across ${filteredData.length} categories.`);
-      onNavigate('BRACKET');
-
+      setExtractedCategories(categories);
+      setSelectedReviewCategory(categories[0]?.weight || '');
+      setMode('review');
     } catch (error: any) {
-      console.error("[Draw Reader] ERROR:", error);
       alert("Error processing PDF: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
   };
 
-  if (showPreview) {
+  // --- Process per-category PDFs ---
+  const handleProcessCategoryPDF = async (weight: string) => {
+    const uploadState = categoryUploads[weight];
+    if (!uploadState?.file) return;
+    if (!tournament) return;
+
+    setCategoryUploads(prev => ({ ...prev, [weight]: { ...prev[weight], status: 'processing' } }));
+    try {
+      const extracted = await extractBracketFromPDF(uploadState.file, weight);
+      const catData = extracted[0]; // single-category mode returns array with 1 item
+      if (!catData) throw new Error('No data extracted');
+
+      const matches = padAndOrderR1Matches({ ...catData, weight });
+      const newCat: ExtractedCategory = {
+        weight,
+        participantCount: catData.participant_count || 0,
+        matches,
+      };
+
+      setExtractedCategories(prev => {
+        const filtered = prev.filter(c => c.weight !== weight);
+        return [...filtered, newCat];
+      });
+
+      setCategoryUploads(prev => ({ ...prev, [weight]: { ...prev[weight], status: 'done' } }));
+    } catch (err: any) {
+      setCategoryUploads(prev => ({ ...prev, [weight]: { ...prev[weight], status: 'error', error: err.message } }));
+    }
+  };
+
+  // Enter review from per-category uploads
+  const handleReviewPerCategory = () => {
+    if (extractedCategories.length === 0) {
+      alert('Upload and process at least one category PDF first.');
+      return;
+    }
+    setSelectedReviewCategory(extractedCategories[0]?.weight || '');
+    setMode('review');
+  };
+
+  // Enter review from manual mode
+  const handleStartManualBracket = () => {
+    if (allConfiguredCategories.length === 0) {
+      alert('No categories configured for this tournament.');
+      return;
+    }
+    // Build empty match structure from roster counts
+    const categories: ExtractedCategory[] = allConfiguredCategories.map(c => {
+      const rosterAthletes = rosterByCategory[c.weight] || [];
+      const fieldSize = getBracketParticipantCount(Math.max(rosterAthletes.length, 2));
+      const matchCount = fieldSize / 2;
+      const matches: ExtractedMatch[] = Array.from({ length: matchCount }, (_, i) => ({
+        matchNumber: i + 1,
+        competitor1: rosterAthletes[i * 2] || null,
+        competitor2: rosterAthletes[i * 2 + 1] || null,
+      }));
+      return { weight: c.weight, participantCount: rosterAthletes.length, matches };
+    });
+    setExtractedCategories(categories);
+    setSelectedReviewCategory(categories[0]?.weight || '');
+    setMode('review');
+  };
+
+  // --- Save reviewed brackets to DB ---
+  const handleSaveReviewedBrackets = async () => {
+    if (!tournament) return;
+    setIsSaving(true);
+    try {
+      const tournamentIdNum = parseInt(String(tournament.id), 10);
+      if (!Number.isFinite(tournamentIdNum) || tournamentIdNum <= 0) {
+        alert('Invalid tournament ID.');
+        return;
+      }
+
+      const matchesToInsert: any[] = [];
+
+      for (const cat of extractedCategories) {
+        let categoryMatchIndex = 1;
+        for (const match of cat.matches) {
+          matchesToInsert.push({
+            tournament_id: tournamentIdNum,
+            match_number: categoryMatchIndex++,
+            weight_category: cat.weight,
+            competitor_1: null,
+            competitor_2: null,
+            bracket_data: {
+              competitor1: match.competitor1 ? { name: match.competitor1.name, country: match.competitor1.country } : null,
+              competitor2: match.competitor2 ? { name: match.competitor2.name, country: match.competitor2.country } : null,
+            },
+          });
+        }
+      }
+
+      await supabase.from('competition_brackets').delete().eq('tournament_id', tournamentIdNum);
+      if (matchesToInsert.length > 0) {
+        const { error } = await supabase.from('competition_brackets').insert(matchesToInsert);
+        if (error) throw error;
+      }
+
+      await supabase.from('tournaments').update({ status: 'upcoming' }).eq('id', tournamentIdNum);
+
+      alert(`Brackets saved! ${matchesToInsert.length} matches across ${extractedCategories.length} categories.`);
+      onNavigate('BRACKET');
+    } catch (error: any) {
+      alert("Error saving brackets: " + (error?.message || String(error)));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // --- Review editing helpers ---
+  const updateCompetitor = (
+    categoryWeight: string,
+    matchIndex: number,
+    slot: 'competitor1' | 'competitor2',
+    field: 'name' | 'country',
+    value: string
+  ) => {
+    setExtractedCategories(prev => prev.map(cat => {
+      if (cat.weight !== categoryWeight) return cat;
+      const matches = cat.matches.map((m, i) => {
+        if (i !== matchIndex) return m;
+        const existing = m[slot] || { name: '', country: '' };
+        return { ...m, [slot]: { ...existing, [field]: value } };
+      });
+      return { ...cat, matches };
+    }));
+  };
+
+  const clearSlot = (categoryWeight: string, matchIndex: number, slot: 'competitor1' | 'competitor2') => {
+    setExtractedCategories(prev => prev.map(cat => {
+      if (cat.weight !== categoryWeight) return cat;
+      const matches = cat.matches.map((m, i) => {
+        if (i !== matchIndex) return m;
+        return { ...m, [slot]: null };
+      });
+      return { ...cat, matches };
+    }));
+  };
+
+  const swapCompetitors = (categoryWeight: string, matchIndex: number) => {
+    setExtractedCategories(prev => prev.map(cat => {
+      if (cat.weight !== categoryWeight) return cat;
+      const matches = cat.matches.map((m, i) => {
+        if (i !== matchIndex) return m;
+        return { ...m, competitor1: m.competitor2, competitor2: m.competitor1 };
+      });
+      return { ...cat, matches };
+    }));
+  };
+
+  const deleteMatch = (categoryWeight: string, matchIndex: number) => {
+    setExtractedCategories(prev => prev.map(cat => {
+      if (cat.weight !== categoryWeight) return cat;
+      const matches = cat.matches.filter((_, i) => i !== matchIndex).map((m, i) => ({ ...m, matchNumber: i + 1 }));
+      return { ...cat, matches };
+    }));
+  };
+
+  const addMatch = (categoryWeight: string) => {
+    setExtractedCategories(prev => prev.map(cat => {
+      if (cat.weight !== categoryWeight) return cat;
+      const newMatch: ExtractedMatch = {
+        matchNumber: cat.matches.length + 1,
+        competitor1: null,
+        competitor2: null,
+      };
+      return { ...cat, matches: [...cat.matches, newMatch] };
+    }));
+  };
+
+  // --- Render: Review mode ---
+  if (mode === 'review') {
+    const currentCat = extractedCategories.find(c => c.weight === selectedReviewCategory);
+    const athleteCount = currentCat ? currentCat.matches.reduce((acc, m) => {
+      if (m.competitor1?.name) acc++;
+      if (m.competitor2?.name) acc++;
+      return acc;
+    }, 0) : 0;
+    const byeCount = currentCat ? currentCat.matches.reduce((acc, m) => {
+      if (!m.competitor1 || !m.competitor1.name) acc++;
+      if (!m.competitor2 || !m.competitor2.name) acc++;
+      return acc;
+    }, 0) : 0;
+
     return (
       <div className="flex flex-col h-full bg-slate-100 overflow-hidden">
         {/* Header */}
         <div className="bg-white px-6 py-4 shadow-sm border-b border-slate-200 z-10 flex justify-between items-center">
           <div className="flex items-center gap-4">
-            <button onClick={() => setShowPreview(false)} className="p-2 hover:bg-slate-100 rounded-lg text-slate-500">
+            <button
+              onClick={() => {
+                if (confirm('Discard extracted data and go back to upload?')) {
+                  setMode('upload');
+                  setExtractedCategories([]);
+                }
+              }}
+              className="p-2 hover:bg-slate-100 rounded-lg text-slate-500"
+            >
               <ArrowLeft size={20} />
             </button>
             <div>
-              <h1 className="text-xl font-bold text-slate-900">Bracket Preview</h1>
-              <p className="text-sm text-slate-500">Review the PDF extraction before saving</p>
+              <h1 className="text-xl font-bold text-slate-900">Review & Edit Brackets</h1>
+              <p className="text-sm text-slate-500">Verify extraction, fix errors, add missing athletes, then save.</p>
             </div>
           </div>
-          <Button onClick={() => onNavigate('ROSTER')} icon={Save} className="bg-green-600 hover:bg-green-700 text-white">
-            Save Brackets
+          <Button
+            onClick={handleSaveReviewedBrackets}
+            disabled={isSaving || extractedCategories.length === 0}
+            className="bg-green-600 hover:bg-green-700 text-white"
+            icon={isSaving ? Loader2 : Save}
+          >
+            {isSaving ? 'Saving...' : 'Confirm & Save All'}
           </Button>
         </div>
 
-        {/* Bracket Content */}
-        <div className="flex-1 overflow-auto p-8">
-          <div className="bg-white p-8 rounded-xl shadow-xl border border-slate-200 min-w-max">
-            
-            {/* PDF Header Replica */}
-            <div className="flex justify-between items-center border-b-4 border-slate-900 pb-4 mb-8">
-               <div>
-                 <h2 className="text-3xl font-black uppercase tracking-tight">{tournament?.name || 'OTP Group Tashkent Grand Slam 2026'}</h2>
-                 <p className="text-slate-600 text-lg font-medium">Uzbekistan, Tashkent, 27 Feb - 1 Mar 2026</p>
-               </div>
-               <div className="text-right border-l-2 border-slate-300 pl-6">
-                 <h2 className="text-5xl font-black">-90 kg</h2>
-                 <p className="text-slate-600 font-bold text-lg">Seniors (32)</p>
-               </div>
-            </div>
+        {/* Category tabs */}
+        <div className="bg-white border-b border-slate-200 px-6 flex gap-1 overflow-x-auto">
+          {extractedCategories.map(cat => {
+            const count = cat.matches.reduce((acc, m) => {
+              if (m.competitor1?.name) acc++;
+              if (m.competitor2?.name) acc++;
+              return acc;
+            }, 0);
+            return (
+              <button
+                key={cat.weight}
+                onClick={() => setSelectedReviewCategory(cat.weight)}
+                className={`px-4 py-3 text-sm font-bold border-b-2 whitespace-nowrap transition-colors ${
+                  selectedReviewCategory === cat.weight
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-slate-500 hover:text-slate-700'
+                }`}
+              >
+                {cat.weight}
+                <span className="ml-1.5 text-xs font-normal opacity-70">({count})</span>
+              </button>
+            );
+          })}
+        </div>
 
-            {/* Bracket Layout */}
-            <div className="flex gap-16 relative">
-               {/* Round 1 (Pools) */}
-               <div className="flex flex-col gap-4">
-                  <PoolBlock name="POOL A" athletes={mockPoolA} colorClass="bg-red-200 text-red-900" startMatchNum={1} />
-                  <PoolBlock name="POOL B" athletes={mockPoolB} colorClass="bg-blue-200 text-blue-900" startMatchNum={5} />
-                  <PoolBlock name="POOL C" athletes={mockPoolC} colorClass="bg-yellow-200 text-yellow-900" startMatchNum={9} />
-                  <PoolBlock name="POOL D" athletes={mockPoolD} colorClass="bg-green-200 text-green-900" startMatchNum={13} />
-               </div>
-               
-               {/* Round 2 (Placeholders) */}
-               <div className="flex flex-col justify-around py-8 w-32">
-                  {Array.from({length: 8}).map((_, i) => (
-                    <div key={i} className="relative h-16 flex items-center">
-                       <div className="w-full border-t border-slate-400"></div>
-                       <div className="absolute -right-4 bg-slate-100 border border-slate-400 rounded-full w-8 h-8 flex items-center justify-center text-xs font-bold text-slate-600 z-10">
-                          {17 + i}
-                       </div>
-                    </div>
-                  ))}
-               </div>
-
-               {/* Quarter Finals */}
-               <div className="flex flex-col justify-around py-24 w-32">
-                  {Array.from({length: 4}).map((_, i) => (
-                    <div key={i} className="relative h-32 flex items-center">
-                       <div className="w-full border-t border-slate-400"></div>
-                       <div className="absolute -right-4 bg-slate-100 border border-slate-400 rounded-full w-8 h-8 flex items-center justify-center text-xs font-bold text-slate-600 z-10">
-                          {25 + i}
-                       </div>
-                    </div>
-                  ))}
-               </div>
-
-               {/* Semi Finals */}
-               <div className="flex flex-col justify-around py-48 w-32">
-                  {Array.from({length: 2}).map((_, i) => (
-                    <div key={i} className="relative h-64 flex items-center">
-                       <div className="w-full border-t border-slate-400"></div>
-                       <div className="absolute -right-4 bg-slate-100 border border-slate-400 rounded-full w-8 h-8 flex items-center justify-center text-xs font-bold text-slate-600 z-10">
-                          {31 + i}
-                       </div>
-                    </div>
-                  ))}
-               </div>
-
-               {/* Final */}
-               <div className="flex flex-col justify-center py-48 w-48">
-                  <div className="relative h-64 flex items-center">
-                     <div className="w-full border-t border-slate-400"></div>
-                     <div className="absolute -right-4 bg-slate-100 border border-slate-400 rounded-full w-8 h-8 flex items-center justify-center text-xs font-bold text-slate-600 z-10">
-                        35
-                     </div>
-                  </div>
-               </div>
-
-               {/* Repechage & Final Results Box */}
-               <div className="absolute bottom-0 right-0 w-80">
-                  <div className="border-2 border-red-200 rounded-lg overflow-hidden bg-white shadow-sm">
-                    <div className="bg-red-50 text-red-600 font-bold text-center py-2 border-b-2 border-red-200">
-                      FINAL RESULTS
-                    </div>
-                    <div className="h-48"></div>
-                  </div>
-               </div>
-            </div>
-
-            {/* Repechage Section */}
-            <div className="mt-16 flex gap-4">
-              <div className="w-8 flex items-center justify-center rounded-lg border border-slate-400 bg-slate-200 text-slate-600">
-                <span className="transform -rotate-90 font-black tracking-widest text-sm whitespace-nowrap">REPECHAGE</span>
-              </div>
-              <div className="flex-1 flex flex-col gap-8 py-4">
-                 <div className="flex items-center gap-8">
-                    <div className="w-64 border-b border-slate-400 relative">
-                       <div className="absolute -right-3 top-1/2 -translate-y-1/2 bg-slate-100 border border-slate-400 rounded-full w-6 h-6 flex items-center justify-center text-[10px] font-bold text-slate-600 z-10">29</div>
-                    </div>
-                    <div className="w-64 border-b border-slate-400 relative">
-                       <div className="absolute -right-3 top-1/2 -translate-y-1/2 bg-slate-100 border border-slate-400 rounded-full w-6 h-6 flex items-center justify-center text-[10px] font-bold text-slate-600 z-10">33</div>
-                    </div>
-                 </div>
-                 <div className="flex items-center gap-8">
-                    <div className="w-64 border-b border-slate-400 relative">
-                       <div className="absolute -right-3 top-1/2 -translate-y-1/2 bg-slate-100 border border-slate-400 rounded-full w-6 h-6 flex items-center justify-center text-[10px] font-bold text-slate-600 z-10">30</div>
-                    </div>
-                    <div className="w-64 border-b border-slate-400 relative">
-                       <div className="absolute -right-3 top-1/2 -translate-y-1/2 bg-slate-100 border border-slate-400 rounded-full w-6 h-6 flex items-center justify-center text-[10px] font-bold text-slate-600 z-10">34</div>
-                    </div>
-                 </div>
-              </div>
-            </div>
-
+        {/* Summary bar */}
+        {currentCat && (
+          <div className="bg-blue-50 border-b border-blue-100 px-6 py-2 flex items-center gap-6 text-xs text-blue-700">
+            <span><strong>{currentCat.matches.length}</strong> matches</span>
+            <span><strong>{athleteCount}</strong> athletes</span>
+            {byeCount > 0 && (
+              <span className="flex items-center gap-1 text-amber-600">
+                <AlertTriangle size={12} />
+                <strong>{byeCount}</strong> empty slots (BYEs)
+              </span>
+            )}
           </div>
+        )}
+
+        {/* Match table */}
+        <div className="flex-1 overflow-auto p-6">
+          {currentCat ? (
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
+                    <th className="px-4 py-3 w-12 text-center">#</th>
+                    <th className="px-4 py-3">Competitor 1 (Top)</th>
+                    <th className="px-4 py-3 w-8"></th>
+                    <th className="px-4 py-3">Competitor 2 (Bottom)</th>
+                    <th className="px-4 py-3 w-16 text-center">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {currentCat.matches.map((match, matchIdx) => (
+                    <tr key={matchIdx} className="hover:bg-slate-50 group">
+                      <td className="px-4 py-2 text-center font-mono text-slate-400 text-xs">{match.matchNumber}</td>
+
+                      {/* Competitor 1 */}
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          {match.competitor1?.country ? (
+                            <Flag countryCode={match.competitor1.country} className="w-5 h-3.5 shrink-0" />
+                          ) : (
+                            <div className="w-5 h-3.5 bg-slate-100 rounded shrink-0" />
+                          )}
+                          <NameInput
+                            value={match.competitor1?.name || ''}
+                            onChange={v => updateCompetitor(currentCat.weight, matchIdx, 'competitor1', 'name', v)}
+                          />
+                          <CountryInput
+                            value={match.competitor1?.country || ''}
+                            onChange={v => updateCompetitor(currentCat.weight, matchIdx, 'competitor1', 'country', v)}
+                          />
+                          {match.competitor1?.name && (
+                            <button
+                              onClick={() => clearSlot(currentCat.weight, matchIdx, 'competitor1')}
+                              className="text-slate-300 hover:text-red-400 transition-colors shrink-0"
+                              title="Clear slot"
+                            >
+                              <X size={14} />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* Swap button */}
+                      <td className="px-1 py-2 text-center">
+                        <button
+                          onClick={() => swapCompetitors(currentCat.weight, matchIdx)}
+                          className="p-1 text-slate-300 hover:text-blue-500 transition-colors rounded"
+                          title="Swap competitors"
+                        >
+                          <ArrowLeftRight size={14} />
+                        </button>
+                      </td>
+
+                      {/* Competitor 2 */}
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          {match.competitor2?.country ? (
+                            <Flag countryCode={match.competitor2.country} className="w-5 h-3.5 shrink-0" />
+                          ) : (
+                            <div className="w-5 h-3.5 bg-slate-100 rounded shrink-0" />
+                          )}
+                          <NameInput
+                            value={match.competitor2?.name || ''}
+                            onChange={v => updateCompetitor(currentCat.weight, matchIdx, 'competitor2', 'name', v)}
+                          />
+                          <CountryInput
+                            value={match.competitor2?.country || ''}
+                            onChange={v => updateCompetitor(currentCat.weight, matchIdx, 'competitor2', 'country', v)}
+                          />
+                          {match.competitor2?.name && (
+                            <button
+                              onClick={() => clearSlot(currentCat.weight, matchIdx, 'competitor2')}
+                              className="text-slate-300 hover:text-red-400 transition-colors shrink-0"
+                              title="Clear slot"
+                            >
+                              <X size={14} />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* Delete row */}
+                      <td className="px-4 py-2 text-center">
+                        <button
+                          onClick={() => deleteMatch(currentCat.weight, matchIdx)}
+                          className="p-1 text-slate-200 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                          title="Delete match"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              {/* Add match row */}
+              <div className="px-4 py-3 border-t border-slate-100">
+                <button
+                  onClick={() => addMatch(currentCat.weight)}
+                  className="flex items-center gap-2 text-sm text-blue-600 hover:text-blue-800 font-medium transition-colors"
+                >
+                  <Plus size={16} />
+                  Add Match
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="text-center text-slate-400 py-12">Select a category tab above.</div>
+          )}
         </div>
       </div>
     );
   }
 
+  // --- Render: Upload mode ---
   return (
     <div className="p-8 max-w-4xl mx-auto">
       <button onClick={() => onNavigate('ROSTER')} className="mb-4 text-blue-600 font-bold flex items-center gap-2">
         <ArrowLeft size={16} /> Back to Roster
       </button>
-      
-      <div className="bg-white p-12 rounded-2xl shadow-xl border border-slate-200 text-center">
-        <h1 className="text-4xl font-black mb-4 text-slate-900">Draw PDF Reader</h1>
-        <p className="text-slate-500 mb-12 text-lg">Upload the IJF draw PDF to extract the tournament brackets for: <span className="font-bold text-slate-800">{tournament?.name}</span></p>
-        
-        <div className="border-4 border-dashed border-purple-200 bg-purple-50 rounded-3xl p-16 text-center hover:bg-purple-100 transition-colors cursor-pointer relative group">
-          <input 
-            type="file" 
-            accept=".pdf" 
-            onChange={(e) => setFile(e.target.files?.[0] || null)} 
-            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
-          />
-          <div className="flex flex-col items-center justify-center gap-4">
-            <div className="w-20 h-20 bg-purple-200 text-purple-600 rounded-full flex items-center justify-center group-hover:scale-110 transition-transform">
-              <FileUp size={40} />
-            </div>
-            {file ? (
-              <p className="text-green-600 font-bold text-xl flex items-center gap-2">
-                <CheckCircle size={24} /> {file.name}
-              </p>
-            ) : (
-              <div>
-                <p className="text-purple-900 font-bold text-xl">Click or drag your PDF here</p>
-                <p className="text-purple-500 mt-2">Supported format: .pdf</p>
-              </div>
-            )}
-          </div>
+
+      <div className="bg-white p-10 rounded-2xl shadow-xl border border-slate-200">
+        <h1 className="text-3xl font-black mb-1 text-slate-900">Build Brackets</h1>
+        <p className="text-slate-500 mb-8">
+          Tournament: <span className="font-bold text-slate-800">{tournament?.name}</span>
+        </p>
+
+        {/* Mode selector */}
+        <div className="flex gap-3 mb-8">
+          {[
+            { key: 'single', label: 'Single PDF', desc: 'All categories in one PDF' },
+            { key: 'per-category', label: 'Per-Category PDFs', desc: 'One PDF per weight class (recommended)' },
+            { key: 'manual', label: 'Build Manually', desc: 'No PDF — select athletes from roster' },
+          ].map(opt => (
+            <button
+              key={opt.key}
+              onClick={() => setUploadMode(opt.key as any)}
+              className={`flex-1 px-4 py-4 rounded-xl border-2 text-left transition-all ${
+                uploadMode === opt.key
+                  ? 'border-blue-600 bg-blue-50'
+                  : 'border-slate-200 hover:border-slate-300 bg-white'
+              }`}
+            >
+              <div className={`font-bold text-sm ${uploadMode === opt.key ? 'text-blue-700' : 'text-slate-700'}`}>{opt.label}</div>
+              <div className="text-xs text-slate-500 mt-0.5">{opt.desc}</div>
+            </button>
+          ))}
         </div>
 
-        <div className="mt-12">
-          <Button 
-            onClick={handleProcessPDF}
-            disabled={!file || isProcessing}
-            className={`px-12 py-4 rounded-xl font-black text-lg shadow-xl transition-all ${file ? 'bg-purple-600 hover:bg-purple-700 text-white hover:scale-105' : 'bg-slate-200 text-slate-400'}`}
-            icon={isProcessing ? Loader2 : Upload}
-          >
-            {isProcessing ? 'Processing PDF...' : 'Analyze & Build Bracket'}
-          </Button>
-        </div>
+        {/* Single PDF mode */}
+        {uploadMode === 'single' && (
+          <div className="space-y-6">
+            <div className="border-4 border-dashed border-purple-200 bg-purple-50 rounded-2xl p-10 text-center relative">
+              <input
+                type="file"
+                accept=".pdf"
+                onChange={e => setSingleFile(e.target.files?.[0] || null)}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+              />
+              <div className="flex flex-col items-center gap-3">
+                <div className="w-16 h-16 bg-purple-200 text-purple-600 rounded-full flex items-center justify-center">
+                  <FileUp size={32} />
+                </div>
+                {singleFile ? (
+                  <p className="text-green-600 font-bold flex items-center gap-2">
+                    <CheckCircle size={20} /> {singleFile.name}
+                  </p>
+                ) : (
+                  <div>
+                    <p className="text-purple-900 font-bold">Click or drag PDF here</p>
+                    <p className="text-purple-500 text-sm mt-1">Contains all weight categories</p>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">
+              <strong>Note:</strong> Single PDF mode may mix categories after the 3rd weight class. If you see incorrect athletes, use <strong>Per-Category PDFs</strong> mode instead.
+            </div>
+            <Button
+              onClick={handleProcessSinglePDF}
+              disabled={!singleFile || isProcessing}
+              className={`w-full py-4 rounded-xl font-black text-lg ${singleFile ? 'bg-purple-600 hover:bg-purple-700 text-white' : 'bg-slate-200 text-slate-400'}`}
+              icon={isProcessing ? Loader2 : Upload}
+            >
+              {isProcessing ? 'Processing PDF...' : 'Analyze & Review Bracket'}
+            </Button>
+          </div>
+        )}
+
+        {/* Per-category mode */}
+        {uploadMode === 'per-category' && (
+          <div className="space-y-4">
+            <p className="text-sm text-slate-600 mb-4">
+              Upload one PDF per weight category. Gemini will extract only that category — this prevents cross-category mixing.
+            </p>
+            {allConfiguredCategories.length === 0 ? (
+              <div className="text-center text-slate-400 py-8">No categories configured for this tournament.</div>
+            ) : (
+              <>
+                {allConfiguredCategories.map(cat => {
+                  const state = categoryUploads[cat.weight] || { file: null, status: 'idle' };
+                  const isExtracted = extractedCategories.some(e => e.weight === cat.weight);
+                  return (
+                    <div key={cat.weight} className={`flex items-center gap-4 p-4 rounded-xl border-2 ${
+                      isExtracted ? 'border-green-200 bg-green-50' : 'border-slate-200 bg-white'
+                    }`}>
+                      <div className="w-20 shrink-0">
+                        <span className="font-bold text-slate-700">{cat.weight}</span>
+                        <span className={`block text-xs ${cat.gender === 'Male' ? 'text-blue-500' : 'text-pink-500'}`}>{cat.gender}</span>
+                      </div>
+
+                      {isExtracted ? (
+                        <div className="flex-1 flex items-center gap-2 text-green-700 text-sm font-medium">
+                          <CheckCircle size={16} />
+                          Extracted ({extractedCategories.find(e => e.weight === cat.weight)?.matches.length} matches)
+                        </div>
+                      ) : (
+                        <label className="flex-1 flex items-center gap-3 cursor-pointer">
+                          <div className={`flex-1 px-3 py-2 rounded-lg border text-sm ${state.file ? 'border-blue-300 bg-blue-50 text-blue-700' : 'border-slate-200 bg-slate-50 text-slate-400'}`}>
+                            {state.file ? state.file.name : 'Click to select PDF...'}
+                          </div>
+                          <input
+                            type="file"
+                            accept=".pdf"
+                            className="hidden"
+                            onChange={e => {
+                              const f = e.target.files?.[0] || null;
+                              setCategoryUploads(prev => ({ ...prev, [cat.weight]: { file: f, status: 'idle' } }));
+                            }}
+                          />
+                        </label>
+                      )}
+
+                      {!isExtracted && (
+                        <Button
+                          onClick={() => handleProcessCategoryPDF(cat.weight)}
+                          disabled={!state.file || state.status === 'processing'}
+                          size="sm"
+                          className={state.file ? 'bg-purple-600 hover:bg-purple-700 text-white' : 'bg-slate-200 text-slate-400'}
+                          icon={state.status === 'processing' ? Loader2 : Upload}
+                        >
+                          {state.status === 'processing' ? 'Reading...' : 'Extract'}
+                        </Button>
+                      )}
+
+                      {state.status === 'error' && (
+                        <span className="text-red-500 text-xs">{state.error?.substring(0, 40)}</span>
+                      )}
+                    </div>
+                  );
+                })}
+
+                <Button
+                  onClick={handleReviewPerCategory}
+                  disabled={extractedCategories.length === 0}
+                  className={`w-full py-4 mt-4 rounded-xl font-black text-lg ${extractedCategories.length > 0 ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-slate-200 text-slate-400'}`}
+                  icon={PenLine}
+                >
+                  Review Extracted Categories ({extractedCategories.length}/{allConfiguredCategories.length})
+                </Button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Manual mode */}
+        {uploadMode === 'manual' && (
+          <div className="space-y-6">
+            <p className="text-sm text-slate-600">
+              Build brackets by selecting athletes from your roster. Slots will be pre-filled based on roster order — you can edit everything in the review step.
+            </p>
+
+            {allConfiguredCategories.length === 0 ? (
+              <div className="text-center text-slate-400 py-8">No categories configured for this tournament.</div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  {allConfiguredCategories.map(cat => {
+                    const athletes = rosterByCategory[cat.weight] || [];
+                    return (
+                      <div key={cat.weight} className="flex items-center justify-between p-3 rounded-lg border border-slate-200 bg-slate-50">
+                        <div>
+                          <span className="font-bold text-slate-700">{cat.weight}</span>
+                          <span className={`ml-2 text-xs ${cat.gender === 'Male' ? 'text-blue-500' : 'text-pink-500'}`}>{cat.gender}</span>
+                        </div>
+                        <span className="text-sm text-slate-500">{athletes.length} athletes in roster</span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <Button
+                  onClick={handleStartManualBracket}
+                  className="w-full py-4 rounded-xl font-black text-lg bg-slate-800 hover:bg-slate-900 text-white"
+                  icon={PenLine}
+                >
+                  Build Brackets Manually
+                </Button>
+              </>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 };
+
 export default BuildBracket;
