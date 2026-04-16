@@ -372,6 +372,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [isClosingCategory, setIsClosingCategory] = useState(false);
+  const [isPreviewingScores, setIsPreviewingScores] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // PDF extraction state
@@ -729,6 +730,24 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
     }
   };
 
+  const handlePreviewScores = async (categoryName: string) => {
+    if (!tournament?.id) return;
+    setIsPreviewingScores(true);
+    setMessage({ type: 'info', text: `Calculating preview scores for ${categoryName}...` });
+    try {
+      const result = await calculateScores(tournament.id, categoryName);
+      if (result.success) {
+        setMessage({ type: 'success', text: `Preview scores calculated for "${categoryName}". Category remains open.` });
+      } else {
+        setMessage({ type: 'error', text: result.error || 'Error calculating preview scores.' });
+      }
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Error calculating preview scores.' });
+    } finally {
+      setIsPreviewingScores(false);
+    }
+  };
+
   // ─── Finalize & Close Tournament ─────────────────────────────────────────
   // 1. Calculate scores for all categories
   // 2. Mark tournament as COMPLETED
@@ -944,11 +963,23 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
             </div>
           )}
 
+          {/* Preview Scores — calculates without closing category */}
+          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
+            <button
+              onClick={() => handlePreviewScores(selectedCategory)}
+              disabled={isPreviewingScores || isClosingCategory}
+              className="bg-blue-50 text-blue-700 border border-blue-200 px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-blue-100 transition-colors text-sm disabled:opacity-50"
+            >
+              {isPreviewingScores ? <Loader2 className="animate-spin" size={16} /> : <Calculator size={16} />}
+              Preview Scores
+            </button>
+          )}
+
           {/* Close current category — scores & finalizes this category */}
           {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
             <button
               onClick={() => handleCloseCategory(selectedCategory)}
-              disabled={isClosingCategory}
+              disabled={isClosingCategory || isPreviewingScores}
               className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-emerald-700 transition-colors text-sm disabled:opacity-50"
             >
               {isClosingCategory ? <Loader2 className="animate-spin" size={16} /> : <Calculator size={16} />}

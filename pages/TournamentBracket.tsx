@@ -116,7 +116,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
   const catStatus = categoryStatuses?.[selectedCategory];
   const isCategoryLocked = !isAdmin && (catStatus === 'locked' || catStatus === 'closed');
   const isCategoryClosed = !isAdmin && catStatus === 'closed';
-  const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED' || isCategoryLocked;
+  const isReadOnly = effectiveStatus === 'COMPLETED' || isCategoryLocked;
   const showDragDrop = isAdmin && effectiveStatus !== 'LIVE' && effectiveStatus !== 'COMPLETED';
 
   const placedIds = useMemo(() => {
@@ -427,7 +427,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
   // --- ADMIN: Status Change Handlers ---
   const handleGoLive = async () => {
     if (!tournament?.id || !isAdmin) return;
-    if (!confirm('Start the tournament? All player picks will be locked.')) return;
+    if (!confirm('Start the tournament? Lock categories individually from Enter Results.')) return;
     try {
       const { error } = await supabase
         .from('tournaments')

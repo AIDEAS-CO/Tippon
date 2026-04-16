@@ -5,6 +5,7 @@ import { Mail, Lock, Eye, User, Award, AlertCircle, AtSign, Check, X, LogIn, Use
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
 import { showToast } from '../lib/toast';
+import { APP_VERSION, VERSION_DATE } from '../lib/appVersion';
 
 interface LoginProps {
   onNavigate: (view: ViewState) => void;
@@ -329,6 +330,7 @@ const Login: React.FC<LoginProps> = ({ onNavigate }) => {
                {isRegistering ? 'Sign Up' : 'Log In'}
             </Button>
           </form>
+          <p className="text-[10px] text-slate-400 text-center mt-3">v{APP_VERSION} · {VERSION_DATE}</p>
         </div>
       </div>
     </div>

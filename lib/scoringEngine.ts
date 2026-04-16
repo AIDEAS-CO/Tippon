@@ -352,30 +352,29 @@ function calculateBonusesDetailed(
     const lines: BonusBreakdownLine[] = [];
     let total = 0;
 
-    let perfectCat: string | null = null;
+    const perfectCats: string[] = [];
     for (const cat of userCats) {
       const gsExact =
         cat.breakdown.goldSilver.length === 2 && cat.breakdown.goldSilver.every((d) => d.deviation === 0);
       const bExact =
         cat.breakdown.bronze.length === 2 && cat.breakdown.bronze.every((d) => d.deviation === 0);
       if (gsExact && bExact) {
-        perfectCat = cat.category;
-        break;
+        perfectCats.push(cat.category);
       }
     }
     const pwVal = getCfg(config, 'bonus_perfect_weight');
-    const pwEarned = perfectCat !== null;
-    const pwPts = pwEarned ? pwVal : 0;
-    if (pwEarned) total += pwPts;
+    const pwEarned = perfectCats.length > 0;
+    const pwPts = perfectCats.length * pwVal;
+    if (pwPts > 0) total += pwPts;
     lines.push({
       key: 'bonus_perfect_weight',
-      label: 'Perfect weight (all four medal positions exact in one category)',
+      label: 'Perfect weight (10 pts per category with all four medal positions exact)',
       points: pwPts,
       earned: pwEarned,
       progressRatio: pwEarned ? 1 : 0,
-      progressLabel: pwEarned ? '100%' : '0%',
+      progressLabel: `${perfectCats.length}/${userCats.length} perfect`,
       detail: pwEarned
-        ? `Earned in ${perfectCat}`
+        ? `Earned in: ${perfectCats.join(', ')}`
         : 'Need gold, silver, and both bronze predictions exact in at least one category.',
     });
 
@@ -398,20 +397,21 @@ function calculateBonusesDetailed(
     });
 
     const correctAdditional = userCats.filter((c) => c.breakdown.additionalPick.points > 0).length;
-    const addEarned = correctAdditional >= 10;
+    const addThreshold = Math.max(1, Math.ceil(0.7 * totalCategories));
+    const addEarned = correctAdditional >= addThreshold;
     const addVal = getCfg(config, 'bonus_10_additional');
     const addPts = addEarned ? addVal : 0;
     if (addEarned) total += addPts;
     lines.push({
       key: 'bonus_10_additional',
-      label: '10+ weight categories with additional pick in top 7',
+      label: `70%+ weight categories with additional pick in top 7 (need ${addThreshold}/${totalCategories})`,
       points: addPts,
       earned: addEarned,
-      progressRatio: Math.min(1, correctAdditional / 10),
-      progressLabel: `${correctAdditional}/10`,
+      progressRatio: Math.min(1, correctAdditional / addThreshold),
+      progressLabel: `${correctAdditional}/${addThreshold}`,
       detail: addEarned
         ? `${correctAdditional} categories earned additional-pick points.`
-        : `${correctAdditional}/10 categories needed where additional pick scores (top 7 actual).`,
+        : `${correctAdditional}/${addThreshold} categories needed where additional pick scores (top 7 actual).`,
     });
 
     const perfectPoolCats = userCats.filter(
