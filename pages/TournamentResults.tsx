@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ViewState, Tournament, Match, Competitor, CategoryStandings } from '../types';
 import { supabase } from '../lib/supabaseClient';
-import { calculateAllCategoryScores } from '../lib/scoringEngine';
+import { calculateAllCategoryScores, calculateScores, calculateBonusesAndMedalTable } from '../lib/scoringEngine';
+import { CategoryStatus } from '../types';
 import Flag from '../components/ui/Flag';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
@@ -337,12 +338,16 @@ interface TournamentResultsProps {
   onNavigate: (view: ViewState) => void;
   tournament: Tournament | null;
   onTournamentUpdated?: () => void;
+  categoryStatuses?: Record<string, CategoryStatus>;
+  onCategoryClose?: (tournamentId: string, categoryName: string) => Promise<void>;
 }
 
 const TournamentResults: React.FC<TournamentResultsProps> = ({
   onNavigate,
   tournament,
   onTournamentUpdated,
+  categoryStatuses,
+  onCategoryClose,
 }) => {
   const [matches, setMatches] = useState<Match[]>([]);
   const [results, setResults] = useState<Record<string, string>>({});
@@ -354,6 +359,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
+  const [isClosingCategory, setIsClosingCategory] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // PDF extraction state
@@ -682,6 +688,35 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
     }
   };
 
+  // ─── Close Single Category ────────────────────────────────────────────────
+  const handleCloseCategory = async (categoryName: string) => {
+    if (!tournament?.id) return;
+    if (!confirm(
+      `Close "${categoryName}"?\n\nThis will calculate scores for this category. Players will no longer be able to edit picks for it.`
+    )) return;
+
+    setIsClosingCategory(true);
+    setMessage({ type: 'info', text: `Calculating scores for ${categoryName}...` });
+
+    try {
+      const result = await calculateScores(tournament.id, categoryName);
+      if (!result.success && result.error) {
+        console.warn('[CloseCategory] score error:', result.error);
+      }
+
+      // Delegate status update + auto-finalize check to App.tsx
+      if (onCategoryClose) {
+        await onCategoryClose(tournament.id, categoryName);
+      }
+
+      setMessage({ type: 'success', text: `"${categoryName}" closed. Scores calculated.` });
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Error closing category.' });
+    } finally {
+      setIsClosingCategory(false);
+    }
+  };
+
   // ─── Finalize & Close Tournament ─────────────────────────────────────────
   // 1. Calculate scores for all categories
   // 2. Mark tournament as COMPLETED
@@ -830,11 +865,12 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
                       <li key={cat}>
                         <button
                           onClick={() => { setSelectedCategory(cat); setIsCategoryDropdownOpen(false); }}
-                          className={`w-full text-left px-4 py-2 text-sm hover:bg-slate-50 ${
+                          className={`w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2 ${
                             selectedCategory === cat ? 'font-bold text-emerald-600 bg-emerald-50' : 'text-slate-700'
                           }`}
                         >
-                          {cat}
+                          <span className="flex-1">{cat}</span>
+                          {categoryStatuses?.[cat] === 'closed' && <Lock size={12} className="text-slate-400" />}
                         </button>
                       </li>
                     ))}
@@ -869,14 +905,32 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
             Save Results
           </button>
 
-          {/* Finalize & Close — calculates + closes in one step */}
+          {/* Close current category — scores & locks picks for this category */}
+          {selectedCategory && categoryStatuses?.[selectedCategory] !== 'closed' && (
+            <button
+              onClick={() => handleCloseCategory(selectedCategory)}
+              disabled={isClosingCategory}
+              className="bg-amber-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-amber-700 transition-colors text-sm disabled:opacity-50"
+            >
+              {isClosingCategory ? <Loader2 className="animate-spin" size={16} /> : <Lock size={16} />}
+              Close {selectedCategory}
+            </button>
+          )}
+          {selectedCategory && categoryStatuses?.[selectedCategory] === 'closed' && (
+            <div className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-500 rounded-lg border border-slate-200 text-sm font-bold">
+              <Lock size={14} />
+              {selectedCategory} closed
+            </div>
+          )}
+
+          {/* Finalize & Close All — scores all remaining open categories + closes tournament */}
           <button
             onClick={handleFinalizeTournament}
             disabled={isClosing}
             className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-slate-900 transition-colors text-sm disabled:opacity-50"
           >
             {isClosing ? <Loader2 className="animate-spin" size={16} /> : <Lock size={16} />}
-            Finalize & Close
+            Finalize & Close All
           </button>
         </div>
       </header>

@@ -8,7 +8,7 @@ import { MEDAL_TABLE_CATEGORY } from '../lib/tournamentConstants';
 /** Stored in `user_picks.category` — distinct from weight-class keys. */
 export { MEDAL_TABLE_CATEGORY };
 
-const RANK_SLOTS = 10;
+const RANK_SLOTS = 3;
 
 /** IOC-ish codes from PDF/draw `bracket_data` blobs. */
 function countriesFromCompetitionBracketRows(rows: unknown[]): string[] {
@@ -48,7 +48,7 @@ const MedalTablePicks: React.FC<MedalTablePicksProps> = ({
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const rankLabels = useMemo(
-    () => ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th', '9th', '10th'],
+    () => Array.from({ length: RANK_SLOTS }, (_, i) => ['1st', '2nd', '3rd'][i] ?? `${i + 1}th`),
     []
   );
 

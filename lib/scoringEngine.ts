@@ -414,46 +414,31 @@ function calculateBonusesDetailed(
         : `${correctAdditional}/10 categories needed where additional pick scores (top 7 actual).`,
     });
 
-    const poolIssues: string[] = [];
-    for (const c of userCats) {
-      const pf = c.breakdown.poolFinals;
-      if (pf.total === 0) poolIssues.push(`${c.category}: no QF field`);
-      else if (pf.correct !== pf.total) poolIssues.push(`${c.category}: ${pf.correct}/${pf.total} QF athletes`);
-    }
-    const allPoolsEarned =
-      totalCategories > 0 &&
-      userCats.length === totalCategories &&
-      userCats.every(
-        (c) => c.breakdown.poolFinals.total > 0 && c.breakdown.poolFinals.correct === c.breakdown.poolFinals.total
-      );
+    const perfectPoolCats = userCats.filter(
+      (c) => c.breakdown.poolFinals.total > 0 && c.breakdown.poolFinals.correct === c.breakdown.poolFinals.total
+    );
+    const perfectPoolCount = perfectPoolCats.length;
     const poolVal = getCfg(config, 'bonus_all_pools');
-    const poolPts = allPoolsEarned ? poolVal : 0;
-    if (allPoolsEarned) total += poolPts;
-    const poolProgress =
-      totalCategories > 0 && userCats.length === totalCategories
-        ? userCats.filter((c) => c.breakdown.poolFinals.total > 0 && c.breakdown.poolFinals.correct === c.breakdown.poolFinals.total).length /
-          totalCategories
-        : userCats.length > 0
-          ? userCats.reduce((s, c) => {
-              const pf = c.breakdown.poolFinals;
-              if (pf.total === 0) return s;
-              return s + pf.correct / pf.total;
-            }, 0) / userCats.length
-          : 0;
+    const poolPts = perfectPoolCount * poolVal;
+    if (poolPts > 0) total += poolPts;
+    const poolProgress = totalCategories > 0 ? perfectPoolCount / totalCategories : 0;
+    const imperfectCats = userCats
+      .filter((c) => !(c.breakdown.poolFinals.total > 0 && c.breakdown.poolFinals.correct === c.breakdown.poolFinals.total))
+      .map((c) => {
+        const pf = c.breakdown.poolFinals;
+        return pf.total === 0 ? `${c.category}: no QF field` : `${c.category}: ${pf.correct}/${pf.total}`;
+      });
     lines.push({
       key: 'bonus_all_pools',
-      label: 'Perfect QF pools in every category',
+      label: 'Perfect QF pool (per category)',
       points: poolPts,
-      earned: allPoolsEarned,
+      earned: perfectPoolCount > 0,
       progressRatio: Math.min(1, poolProgress),
-      progressLabel: allPoolsEarned
-        ? `${totalCategories}/${totalCategories} perfect`
-        : `${userCats.length}/${totalCategories} cats`,
-      detail: allPoolsEarned
-        ? `All ${totalCategories} categories: every QF slot matched.`
-        : userCats.length < totalCategories
-          ? `You have picks in ${userCats.length}/${totalCategories} categories; need all categories scored with 8/8 QF athletes correct in each.`
-          : poolIssues.slice(0, 5).join(' · ') + (poolIssues.length > 5 ? ' …' : ''),
+      progressLabel: `${perfectPoolCount}/${totalCategories} perfect`,
+      detail: perfectPoolCount > 0
+        ? `${perfectPoolCount} categor${perfectPoolCount === 1 ? 'y' : 'ies'} with all QF slots correct: ${perfectPoolCats.map((c) => c.category).join(', ')}.` +
+          (imperfectCats.length > 0 ? ` Not perfect: ${imperfectCats.slice(0, 5).join(' · ')}${imperfectCats.length > 5 ? ' …' : ''}` : '')
+        : imperfectCats.slice(0, 5).join(' · ') + (imperfectCats.length > 5 ? ' …' : ''),
     });
 
     out.set(userId, { bonusLines: lines, categoryTotal: total });
@@ -461,7 +446,7 @@ function calculateBonusesDetailed(
   return out;
 }
 
-const MEDAL_TABLE_SLOTS = 10;
+const MEDAL_TABLE_SLOTS = 3;
 
 async function refreshProfilePointsFromAllScores(userId: string) {
   const { data: allScores } = await supabase.from('tournament_scores').select('total_points').eq('user_id', userId);
@@ -665,4 +650,77 @@ export async function calculateAllCategoryScores(
   }
 
   return { success: errors.length === 0, totalUsersScored, errors };
+}
+
+/**
+ * Calculates medal table scores and bonuses from already-persisted category scores.
+ * Call this after all categories have been closed individually.
+ */
+export async function calculateBonusesAndMedalTable(
+  tournamentId: string | number,
+  allCategories: string[]
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // Medal table
+    await calculateMedalTableScores(tournamentId, allCategories);
+
+    // Re-read all persisted category scores to compute bonuses
+    const { data: scoreRows } = await supabase
+      .from('tournament_scores')
+      .select('user_id, category, breakdown')
+      .eq('tournament_id', tournamentId)
+      .not('category', 'in', '(_bonuses_,_medal_table_)');
+
+    const { data: tournamentData } = await supabase
+      .from('tournaments')
+      .select('scoring_configuration')
+      .eq('id', tournamentId)
+      .single();
+    const config = tournamentData?.scoring_configuration ?? {};
+
+    // Group scores by user
+    const byUser = new Map<string, ScoringCategoryResult[]>();
+    for (const row of scoreRows || []) {
+      const uid = (row as any).user_id;
+      const cat = (row as any).category;
+      const breakdown = (row as any).breakdown as ScoringBreakdown;
+      if (!breakdown || !('poolFinals' in breakdown)) continue;
+      if (!byUser.has(uid)) byUser.set(uid, []);
+      byUser.get(uid)!.push({ userId: uid, category: cat, breakdown, total: breakdown.categoryTotal });
+    }
+
+    const allResults: ScoringCategoryResult[] = [];
+    byUser.forEach((cats) => allResults.push(...cats));
+
+    if (allResults.length > 0) {
+      const bonusMap = calculateBonusesDetailed(allResults, allCategories.length, config);
+      const bonusRows = Array.from(bonusMap.entries()).map(([userId, tb]) => ({
+        user_id: userId,
+        tournament_id: tournamentId,
+        category: '_bonuses_',
+        total_points: tb.categoryTotal,
+        correct_picks: tb.bonusLines.filter((l) => l.earned).length,
+        total_picks: tb.bonusLines.length,
+        breakdown: tb,
+      }));
+      if (bonusRows.length > 0) {
+        await supabase
+          .from('tournament_scores')
+          .upsert(bonusRows, { onConflict: 'user_id,tournament_id,category' });
+        for (const row of bonusRows) {
+          const { data: allScores } = await supabase
+            .from('tournament_scores')
+            .select('total_points')
+            .eq('user_id', row.user_id);
+          if (allScores) {
+            const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
+            await supabase.from('profiles').update({ points: globalPoints }).eq('id', row.user_id);
+          }
+        }
+      }
+    }
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message };
+  }
 }

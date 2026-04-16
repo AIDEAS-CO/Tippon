@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   ViewState,
   Tournament,
@@ -79,8 +79,33 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
   const [medalTableUserPts, setMedalTableUserPts] = useState<
     { userId: string; points: number; name: string; username: string }[]
   >([]);
+  const [medalGenderTab, setMedalGenderTab] = useState<'Total' | 'Men' | 'Women'>('Total');
+  const [categoryGenderMap, setCategoryGenderMap] = useState<Map<string, string>>(new Map());
 
   const completed = (tournament?.status || '').toUpperCase() === 'COMPLETED';
+
+  const [rawMedalData, setRawMedalData] = useState<{
+    dbMatches: any[];
+    rosterMap: Record<string, any>;
+    resultsByCat: Map<string, Record<string, string>>;
+    hasRepechage: boolean;
+  } | null>(null);
+
+  const filteredCountryMedalRows = useMemo(() => {
+    if (!rawMedalData) return countryMedalRows;
+    const targetGender = medalGenderTab === 'Men' ? 'Male' : medalGenderTab === 'Women' ? 'Female' : null;
+    const filteredCats = targetGender
+      ? categories.filter((c) => categoryGenderMap.get(c) === targetGender)
+      : categories;
+    if (filteredCats.length === 0) return [];
+    return computeCountryMedalRanking(
+      filteredCats,
+      rawMedalData.dbMatches,
+      rawMedalData.rosterMap,
+      rawMedalData.resultsByCat,
+      rawMedalData.hasRepechage
+    );
+  }, [medalGenderTab, countryMedalRows, categories, categoryGenderMap, rawMedalData]);
 
   const loadLeaderboard = useCallback(async () => {
     if (!tournament?.id) return;
@@ -135,16 +160,21 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
   useEffect(() => {
     const loadCats = async () => {
       if (!tournament?.id) return;
-      const { data: dbMatches } = await supabase
-        .from('competition_brackets')
-        .select('weight_category')
-        .eq('tournament_id', tournament.id);
+      const [{ data: dbMatches }, { data: catRows }] = await Promise.all([
+        supabase.from('competition_brackets').select('weight_category').eq('tournament_id', tournament.id),
+        supabase.from('categories').select('name, gender').eq('tournament_id', tournament.id),
+      ]);
       const cats = Array.from(
         new Set((dbMatches || []).map((m: any) => m.weight_category).filter(Boolean))
       ) as string[];
       cats.sort();
       setCategories(cats);
       if (cats.length && !selectedCategory) setSelectedCategory(cats[0]);
+      const gmap = new Map<string, string>();
+      for (const row of catRows || []) {
+        if (row.name && row.gender) gmap.set(row.name, row.gender);
+      }
+      setCategoryGenderMap(gmap);
     };
     loadCats();
   }, [tournament?.id]);
@@ -196,6 +226,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
           resultsByCat.get(row.category)![row.match_id] = row.winner_competitor_id;
         }
 
+        setRawMedalData({ dbMatches: dbMatches || [], rosterMap, resultsByCat, hasRepechage });
         const rows = computeCountryMedalRanking(
           categories,
           dbMatches || [],
@@ -488,12 +519,29 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
         {mainTab === 'medalCountry' && (
           <section className="space-y-6">
             <div>
-              <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3">
-                Country medal table (actual results)
-              </h2>
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest">
+                  Country medal table (actual results)
+                </h2>
+                <div className="flex rounded-lg overflow-hidden border border-slate-200 text-xs font-bold">
+                  {(['Total', 'Men', 'Women'] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setMedalGenderTab(tab)}
+                      className={`px-3 py-1.5 transition-colors ${
+                        medalGenderTab === tab
+                          ? 'bg-primary text-white'
+                          : 'bg-white text-slate-600 hover:bg-slate-50'
+                      }`}
+                    >
+                      {tab}
+                    </button>
+                  ))}
+                </div>
+              </div>
               {loadingCountryMedals ? (
                 <Loader2 className="animate-spin text-primary" size={32} />
-              ) : countryMedalRows.length === 0 ? (
+              ) : filteredCountryMedalRows.length === 0 ? (
                 <p className="text-sm text-slate-500">No aggregated medal data yet.</p>
               ) : (
                 <div className="rounded-xl border border-slate-200 bg-white overflow-hidden overflow-x-auto">
@@ -509,7 +557,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
                       </tr>
                     </thead>
                     <tbody>
-                      {countryMedalRows.map((row, idx) => (
+                      {filteredCountryMedalRows.slice(0, 10).map((row, idx) => (
                         <tr key={row.country} className="border-t border-slate-100">
                           <td className="px-3 py-2 font-bold text-slate-400">{idx + 1}</td>
                           <td className="px-3 py-2 font-bold text-slate-900">

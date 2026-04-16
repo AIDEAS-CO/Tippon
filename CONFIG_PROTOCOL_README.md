@@ -374,6 +374,25 @@ ALTER TABLE public.tournament_scores
     FOREIGN KEY (tournament_id) REFERENCES public.tournaments(id) ON DELETE CASCADE;
 ```
 
+### Migration 007 — REQUIRED for per-category closing
+**Add `status` column to the `categories` table.**
+
+Without this, admin cannot close individual weight categories. The UI will gracefully
+degrade (all categories show as open), but the "Close Category" button will update
+a non-existent column and the pick-locking will not persist across sessions.
+
+**Run this in Supabase Dashboard → SQL Editor:**
+
+```sql
+ALTER TABLE public.categories
+  ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+```
+
+After running, category statuses persist in DB. The UI reads/writes this column
+when admin clicks "Close [category]" in TournamentResults.
+
+---
+
 ### Migration 006 — REQUIRED to delete tournaments that have players / picks
 **Add ON DELETE CASCADE to all tournament child tables.**
 

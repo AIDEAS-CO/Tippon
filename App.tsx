@@ -18,8 +18,9 @@ import TournamentFinalResults from './pages/TournamentFinalResults';
 import Leaderboard from './pages/Leaderboard';
 import Profile from './pages/Profile';
 import Navigation from './components/Navigation';
-import { ViewState, UserRole, Tournament, UserPicks, Competitor, UserProfile } from './types';
+import { ViewState, UserRole, Tournament, UserPicks, Competitor, UserProfile, CategoryStatus } from './types';
 import { supabase } from './lib/supabaseClient';
+import { calculateBonusesAndMedalTable } from './lib/scoringEngine';
 
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewState>('LOGIN');
@@ -42,6 +43,9 @@ const App: React.FC = () => {
 
   // Store user picks: Record<TournamentId, Record<CategoryName, UserPicks>>
   const [allUserPicks, setAllUserPicks] = useState<Record<string, Record<string, UserPicks>>>({});
+
+  // Per-category open/closed status: Record<categoryName, CategoryStatus>
+  const [categoryStatuses, setCategoryStatuses] = useState<Record<string, CategoryStatus>>({});
 
   // Unified User Stats (Simulating Database for Leaderboard view mock)
   const [userStats] = useState({
@@ -309,6 +313,7 @@ const App: React.FC = () => {
 
   const handleSelectTournament = async (t: Tournament) => {
       setSelectedTournament(t);
+      loadCategoryStatuses(t.id);
       const freshDetails = await fetchTournamentDetails(t.id);
       if (freshDetails) {
           setSelectedTournament(freshDetails);
@@ -398,6 +403,59 @@ const App: React.FC = () => {
     ));
     if (selectedTournament?.id === tournamentId) {
       setSelectedTournament(prev => prev ? { ...prev, status: newStatus as any } : null);
+    }
+  };
+
+  const loadCategoryStatuses = async (tournamentId: string) => {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('name, status')
+      .eq('tournament_id', tournamentId);
+    if (error || !data) return;
+    const map: Record<string, CategoryStatus> = {};
+    for (const row of data) {
+      map[row.name] = (row.status as CategoryStatus) || 'open';
+    }
+    setCategoryStatuses(map);
+  };
+
+  const handleCategoryClose = async (tournamentId: string, categoryName: string) => {
+    // Mark category as closed in DB
+    const { error } = await supabase
+      .from('categories')
+      .update({ status: 'closed' })
+      .eq('tournament_id', tournamentId)
+      .eq('name', categoryName);
+
+    if (error) {
+      console.error('[handleCategoryClose] DB update failed:', error);
+      // If column doesn't exist yet (migration not run), log but don't crash
+    }
+
+    // Update local state
+    setCategoryStatuses(prev => ({ ...prev, [categoryName]: 'closed' }));
+
+    // Check if ALL categories for this tournament are now closed
+    const { data: allCats } = await supabase
+      .from('categories')
+      .select('name, status')
+      .eq('tournament_id', tournamentId);
+
+    const allClosed = (allCats || []).every(c => (c.status === 'closed') || c.name === categoryName);
+
+    if (allClosed && allCats && allCats.length > 0) {
+      // All categories closed → run medal table + bonuses, then mark tournament COMPLETED
+      const allCatNames = allCats.map(c => c.name);
+      await calculateBonusesAndMedalTable(tournamentId, allCatNames);
+      const { error: statusErr } = await supabase
+        .from('tournaments')
+        .update({ status: 'completed' })
+        .eq('id', tournamentId);
+      if (!statusErr) {
+        handleStatusChange(tournamentId, 'COMPLETED');
+        fetchTournaments();
+        setTimeout(() => setCurrentView('TOURNAMENT_LEADERBOARD'), 1500);
+      }
     }
   };
 
@@ -519,15 +577,16 @@ const App: React.FC = () => {
             setCurrentView(view);
         }} tournament={draftTournament} />;
       case 'BRACKET':
-        return <TournamentBracket 
-            onNavigate={setCurrentView} 
+        return <TournamentBracket
+            onNavigate={setCurrentView}
             returnView={returnView}
-            tournament={selectedTournament} 
+            tournament={selectedTournament}
             existingPicks={selectedTournament ? allUserPicks[selectedTournament.id] : undefined}
             onSavePicks={handleSavePicks}
             userId={userProfile?.id}
             userRole={userRole}
             onStatusChange={handleStatusChange}
+            categoryStatuses={categoryStatuses}
         />;
       case 'MEDAL_TABLE_PICKS':
         return (
@@ -553,13 +612,15 @@ const App: React.FC = () => {
             setCurrentView('BRACKET');
             return null;
         }
-        return <TournamentResults 
+        return <TournamentResults
             onNavigate={setCurrentView}
             tournament={selectedTournament}
             onTournamentUpdated={() => {
               fetchTournaments();
               handleStatusChange(selectedTournament?.id || '', 'COMPLETED');
             }}
+            categoryStatuses={categoryStatuses}
+            onCategoryClose={handleCategoryClose}
         />;
       case 'TOURNAMENT_LEADERBOARD':
         return <Leaderboard 

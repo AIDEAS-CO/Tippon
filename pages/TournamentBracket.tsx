@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { ViewState, UserRole, UserPicks, Match, Tournament, Competitor } from '../types';
+import { ViewState, UserRole, UserPicks, Match, Tournament, Competitor, CategoryStatus } from '../types';
 import MatchCard from '../components/MatchCard';
 import { ArrowLeft, ChevronDown, Loader2, CheckCircle, Trophy, Lock, PanelLeftOpen, PanelLeftClose, Search, Check, Play, BarChart3, ClipboardCheck, Medal } from 'lucide-react';
 import Flag from '../components/ui/Flag';
 import { supabase } from '../lib/supabaseClient';
 import { calculateMyScore } from '../lib/scoringEngine';
-import { getBracketParticipantCount, buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds } from '../lib/bracketUtils';
+import { getBracketParticipantCount, buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds, deriveStandings } from '../lib/bracketUtils';
 
 interface BracketProps {
   onNavigate: (view: ViewState) => void;
@@ -16,6 +16,7 @@ interface BracketProps {
   userId?: string;
   userRole?: UserRole;
   onStatusChange?: (tournamentId: string, newStatus: string) => void;
+  categoryStatuses?: Record<string, CategoryStatus>;
 }
 
 const BracketNode: React.FC<{
@@ -79,7 +80,7 @@ const BracketNode: React.FC<{
   );
 };
 
-const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tournament, existingPicks, onSavePicks, userId, userRole, onStatusChange }) => {
+const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tournament, existingPicks, onSavePicks, userId, userRole, onStatusChange, categoryStatuses }) => {
   const [matches, setMatches] = useState<Match[]>([]);
   const [picks, setPicks] = useState<UserPicks>({});
   const [champion, setChampion] = useState<string | null>(null);
@@ -99,6 +100,8 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
   const [sidebarDropActive, setSidebarDropActive] = useState(false);
   const [userScore, setUserScore] = useState<{ points: number; correct: number; total: number } | null>(null);
   const [localStatus, setLocalStatus] = useState(tournament?.status?.toUpperCase());
+  const [showConfirmation, setShowConfirmation] = useState(false);
+  const [pendingSaveData, setPendingSaveData] = useState<{ picks: UserPicks; completion: number } | null>(null);
 
   useEffect(() => {
     if (tournament?.status) {
@@ -108,7 +111,8 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
 
   const isAdmin = userRole === 'ADMIN';
   const effectiveStatus = (localStatus || tournament?.status || '').toUpperCase();
-  const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED';
+  const isCategoryClosed = !isAdmin && categoryStatuses?.[selectedCategory] === 'closed';
+  const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED' || isCategoryClosed;
   const showDragDrop = isAdmin && effectiveStatus !== 'LIVE' && effectiveStatus !== 'COMPLETED';
 
   const placedIds = useMemo(() => {
@@ -548,10 +552,9 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
     if (match.round === 'F') setChampion(competitorId);
   };
 
-  // --- SAVE HANDLER ---
+  // --- SAVE HANDLER (phase 1: show confirmation) ---
   const handleSave = () => {
     if (isReadOnly || !tournament) return;
-    setIsSubmitting(true);
 
     const medalists = getPredictedMedalistCompetitorIds(matches, picks);
     let toSave: UserPicks = { ...picks };
@@ -561,19 +564,31 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       setPicks(toSave);
     }
 
-    const storageKey = `tippon-picks-${userId || 'anon'}-${tournament.id}-${selectedCategory}`;
-    localStorage.setItem(storageKey, JSON.stringify(toSave));
-
     const bracketPickCount = Object.keys(toSave).filter(k => k !== 'additional_pick').length;
     const completion = matches.length > 0
       ? Math.round((bracketPickCount / matches.length) * 100)
       : 0;
+
+    setPendingSaveData({ picks: toSave, completion });
+    setShowConfirmation(true);
+  };
+
+  // --- SAVE HANDLER (phase 2: confirmed) ---
+  const handleConfirmSave = () => {
+    if (!tournament || !pendingSaveData) return;
+    setShowConfirmation(false);
+    setIsSubmitting(true);
+
+    const { picks: toSave, completion } = pendingSaveData;
+    const storageKey = `tippon-picks-${userId || 'anon'}-${tournament.id}-${selectedCategory}`;
+    localStorage.setItem(storageKey, JSON.stringify(toSave));
 
     onSavePicks?.(tournament.id, selectedCategory, toSave, completion);
 
     setTimeout(() => {
       setIsSubmitting(false);
       setShowSaved(true);
+      setPendingSaveData(null);
       setTimeout(() => setShowSaved(false), 2500);
     }, 600);
   };
@@ -621,9 +636,10 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                         <li key={cat}>
                           <button
                             onClick={() => { setSelectedCategory(cat); setIsCategoryDropdownOpen(false); }}
-                            className={`w-full text-left px-4 py-2 text-sm hover:bg-slate-50 ${selectedCategory === cat ? 'font-bold text-primary bg-blue-50' : 'text-slate-700'}`}
+                            className={`w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2 ${selectedCategory === cat ? 'font-bold text-primary bg-blue-50' : 'text-slate-700'}`}
                           >
-                            {cat}
+                            <span className="flex-1">{cat}</span>
+                            {categoryStatuses?.[cat] === 'closed' && <Lock size={12} className="text-slate-400 flex-shrink-0" />}
                           </button>
                         </li>
                       ))}
@@ -700,7 +716,9 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           {isReadOnly ? (
             <div className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-500 rounded-lg border border-slate-200">
               <Lock size={16} />
-              <span className="text-xs font-bold uppercase tracking-wide">Picks Locked</span>
+              <span className="text-xs font-bold uppercase tracking-wide">
+                {isCategoryClosed ? `${selectedCategory} Closed` : 'Picks Locked'}
+              </span>
             </div>
           ) : showSaved ? (
             <div className="flex items-center gap-2 px-6 py-2 bg-green-500 text-white rounded-lg font-bold shadow-lg shadow-green-500/20 animate-pulse">
@@ -1013,6 +1031,91 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           </div>
         </main>
       </div>
+
+      {/* --- PICKS CONFIRMATION MODAL --- */}
+      {showConfirmation && pendingSaveData && (() => {
+        const standings = deriveStandings(matches, pendingSaveData.picks);
+        const positionLabel: Record<number, string> = { 1: 'Gold', 2: 'Silver', 3: 'Bronze', 5: '5th', 7: '7th' };
+        const positionColor: Record<number, string> = {
+          1: 'text-yellow-600 font-black',
+          2: 'text-slate-500 font-bold',
+          3: 'text-amber-700 font-bold',
+          5: 'text-slate-500',
+          7: 'text-slate-400',
+        };
+        const apId = pendingSaveData.picks['additional_pick'];
+        const apCompetitor = apId ? matches.flatMap(m => [m.competitor1, m.competitor2]).find(c => c?.id === apId) : null;
+        const bracketPickCount = Object.keys(pendingSaveData.picks).filter(k => k !== 'additional_pick').length;
+
+        return (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+              <div className="bg-primary text-white px-6 py-4">
+                <h2 className="text-lg font-black">Confirm Picks — {selectedCategory}</h2>
+                <p className="text-sm text-blue-100 mt-0.5">{bracketPickCount} match{bracketPickCount !== 1 ? 'es' : ''} picked · {pendingSaveData.completion}% complete</p>
+              </div>
+
+              <div className="p-6">
+                {standings.length > 0 ? (
+                  <table className="w-full text-sm mb-4">
+                    <thead>
+                      <tr className="border-b border-slate-200">
+                        <th className="text-left text-xs text-slate-400 uppercase pb-2 font-bold">Position</th>
+                        <th className="text-left text-xs text-slate-400 uppercase pb-2 font-bold">Athlete</th>
+                        <th className="text-left text-xs text-slate-400 uppercase pb-2 font-bold">Country</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {standings.map((s, i) => (
+                        <tr key={i} className="border-b border-slate-100 last:border-0">
+                          <td className={`py-2 pr-3 ${positionColor[s.position] || 'text-slate-500'}`}>
+                            {positionLabel[s.position] ?? `${s.position}th`}
+                          </td>
+                          <td className="py-2 pr-3 font-semibold text-slate-800">{s.competitorName}</td>
+                          <td className="py-2 text-slate-500">
+                            <div className="flex items-center gap-1.5">
+                              <Flag countryCode={s.country} className="w-5 h-3.5 shadow-sm" />
+                              <span>{s.country}</span>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-sm text-slate-400 italic mb-4">No completed bracket path yet.</p>
+                )}
+
+                {apCompetitor && (
+                  <div className="bg-slate-50 rounded-lg px-4 py-2 mb-4 text-sm flex items-center gap-2 border border-slate-200">
+                    <Medal size={14} className="text-slate-500" />
+                    <span className="text-slate-500 font-medium">Additional pick:</span>
+                    <Flag countryCode={apCompetitor.country} className="w-4 h-3 shadow-sm" />
+                    <span className="font-semibold text-slate-800">{apCompetitor.name}</span>
+                    <span className="text-slate-500">{apCompetitor.country}</span>
+                  </div>
+                )}
+
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setShowConfirmation(false)}
+                    className="flex-1 px-4 py-2 rounded-lg border border-slate-300 text-slate-700 font-bold hover:bg-slate-50 transition-colors"
+                  >
+                    Go Back
+                  </button>
+                  <button
+                    onClick={handleConfirmSave}
+                    className="flex-1 px-4 py-2 rounded-lg bg-primary text-white font-bold hover:bg-blue-600 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20"
+                  >
+                    <CheckCircle size={16} />
+                    Confirm Save
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };
