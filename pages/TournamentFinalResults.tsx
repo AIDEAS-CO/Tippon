@@ -10,7 +10,7 @@ import {
 import { supabase } from '../lib/supabaseClient';
 import { buildMatchesForBracket, deriveStandings } from '../lib/bracketUtils';
 import { computeCountryMedalRanking, type CountryMedalRow } from '../lib/countryMedalRanking';
-import { MEDAL_TABLE_CATEGORY } from '../lib/tournamentConstants';
+import { MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL } from '../lib/tournamentConstants';
 import Flag from '../components/ui/Flag';
 import { ArrowLeft, Loader2, ChevronDown, Trophy } from 'lucide-react';
 
@@ -204,9 +204,9 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
               .eq('tournament_id', tournament.id),
             supabase
               .from('tournament_scores')
-              .select('user_id, total_points')
+              .select('user_id, total_points, category')
               .eq('tournament_id', tournament.id)
-              .eq('category', MEDAL_TABLE_CATEGORY),
+              .in('category', [MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL, '_medal_table_']),
           ]);
 
         const rosterMap: Record<string, any> = {};
@@ -357,8 +357,13 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
     );
   }
 
-  const categoryTitle = (c: string) =>
-    c === '_medal_table_' ? 'Medal table' : c === '_bonuses_' ? 'Tournament bonuses' : c;
+  const categoryTitle = (c: string) => {
+    if (c === MEDAL_TABLE_MEN) return 'Medal table (Men)';
+    if (c === MEDAL_TABLE_WOMEN) return 'Medal table (Women)';
+    if (c === MEDAL_TABLE_TOTAL || c === '_medal_table_') return 'Medal table (Total)';
+    if (c === '_bonuses_') return 'Tournament bonuses';
+    return c;
+  };
 
   const verifiedBreakdownSum =
     selectedUserId && userScoreRows

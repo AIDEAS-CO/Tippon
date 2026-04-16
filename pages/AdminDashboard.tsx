@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
+import { showToast } from '../lib/toast';
 
 interface AdminDashboardProps {
   onNavigate: (view: ViewState) => void;
@@ -222,7 +223,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       // 1. Prevention of double submission
       if (isNavigating) return;
 
-      if (!formData.name || !formData.date) { alert("Please complete the name and date."); return; }
+      if (!formData.name || !formData.date) { showToast('warning', 'Please complete the tournament name and date.'); return; }
       
       setIsNavigating(true);
       try {
@@ -269,7 +270,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
           window.scrollTo(0,0);
       } catch (err: any) {
           console.error("Error saving step 1:", err);
-          alert("Error saving: " + err.message);
+          showToast('error', "Error saving: " + err.message);
       } finally {
           setIsNavigating(false);
       }
@@ -372,7 +373,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
 
     } catch (error: any) {
         console.error("Error saving rules:", error);
-        alert("Error: " + error.message);
+        showToast('error', "Error saving scoring rules: " + error.message);
     } finally { setIsNavigating(false); }
   };
 

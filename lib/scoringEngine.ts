@@ -10,7 +10,7 @@ import {
 } from '../types';
 import { buildMatchesForBracket, deriveStandings, getQFParticipants } from './bracketUtils';
 import { computeCountryMedalRanking, countryRanksFromMedalRows } from './countryMedalRanking';
-import { MEDAL_TABLE_CATEGORY } from './tournamentConstants';
+import { MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL } from './tournamentConstants';
 
 /** One user's scored category — used to aggregate tournament bonuses. */
 export interface ScoringCategoryResult {
@@ -457,8 +457,9 @@ async function refreshProfilePointsFromAllScores(userId: string) {
 }
 
 /**
- * Scores country medal table predictions vs actual medal counts aggregated across weight categories.
- * Persists `tournament_scores` row `category = '_medal_table_'`.
+ * Scores country medal table predictions for Men, Women, and Total tables.
+ * Persists `tournament_scores` rows for `_medal_table_men_`, `_medal_table_women_`, `_medal_table_total_`.
+ * Each table awards up to 12 points (4/3/2/1 for exact/±1/±2/±3). Total max: 36 pts.
  */
 export async function calculateMedalTableScores(
   tournamentId: string | number,
@@ -473,6 +474,16 @@ export async function calculateMedalTableScores(
     if (tErr) throw tErr;
     const config: Record<string, any> = tournamentData?.scoring_configuration ?? {};
     const hasRepechage = !!config.has_repechage;
+
+    // Load category → gender map
+    const { data: catRows } = await supabase
+      .from('categories')
+      .select('name, gender')
+      .eq('tournament_id', tournamentId);
+    const catGenderMap = new Map<string, string>();
+    for (const c of catRows || []) {
+      if (c.name && c.gender) catGenderMap.set(c.name, c.gender);
+    }
 
     const [{ data: dbMatches }, { data: roster }, { data: resultRows }] = await Promise.all([
       supabase.from('competition_brackets').select('*').eq('tournament_id', tournamentId).order('match_number', { ascending: true }),
@@ -498,86 +509,110 @@ export async function calculateMedalTableScores(
       resultsByCat.get(row.category)![row.match_id] = row.winner_competitor_id;
     }
 
-    const medalRows = computeCountryMedalRanking(
-      categories,
-      dbMatches || [],
-      rosterMap,
-      resultsByCat,
-      hasRepechage
-    );
-    const rankByCountry = countryRanksFromMedalRows(medalRows);
+    // Build gender-filtered category lists
+    const menCats = categories.filter(c => catGenderMap.get(c) === 'Male');
+    const womenCats = categories.filter(c => catGenderMap.get(c) === 'Female');
+
+    const tableConfigs: Array<{ catKey: string; filteredCats: string[]; legacyKey?: string }> = [
+      { catKey: MEDAL_TABLE_MEN, filteredCats: menCats },
+      { catKey: MEDAL_TABLE_WOMEN, filteredCats: womenCats },
+      { catKey: MEDAL_TABLE_TOTAL, filteredCats: categories, legacyKey: '_medal_table_' },
+    ];
 
     const maxPerSlot = getCfg(config, 'medal_table_exact');
     const maxPossible = MEDAL_TABLE_SLOTS * maxPerSlot;
 
-    const { data: picksRows, error: pErr } = await supabase
-      .from('user_picks')
-      .select('user_id, picks_data')
-      .eq('tournament_id', tournamentId)
-      .eq('category', MEDAL_TABLE_CATEGORY);
-    if (pErr && (pErr as { code?: string }).code !== '42P01') throw pErr;
+    const allScoreRows: any[] = [];
 
-    const scoreRows: any[] = [];
-    for (const pr of picksRows || []) {
-      const picks = (pr as { picks_data?: Record<string, string> }).picks_data;
-      const uid = (pr as { user_id: string }).user_id;
-      if (!picks || typeof picks !== 'object') continue;
+    for (const { catKey, filteredCats, legacyKey } of tableConfigs) {
+      const medalRows = computeCountryMedalRanking(
+        filteredCats,
+        dbMatches || [],
+        rosterMap,
+        resultsByCat,
+        hasRepechage
+      );
+      const rankByCountry = countryRanksFromMedalRows(medalRows);
 
-      const lines: MedalTableScoreLine[] = [];
-      let total = 0;
+      // Fetch picks for this category key (and legacy key if applicable)
+      const keysToFetch = legacyKey ? [catKey, legacyKey] : [catKey];
+      const { data: picksRows } = await supabase
+        .from('user_picks')
+        .select('user_id, picks_data, category')
+        .eq('tournament_id', tournamentId)
+        .in('category', keysToFetch);
 
-      for (let slot = 1; slot <= MEDAL_TABLE_SLOTS; slot++) {
-        const cc = String(picks[String(slot)] || '').trim().toUpperCase();
-        if (!cc || cc === 'N/A') continue;
+      // Deduplicate by user_id — prefer the new key over legacy
+      const picksByUser = new Map<string, Record<string, string>>();
+      for (const pr of picksRows || []) {
+        const uid = (pr as { user_id: string }).user_id;
+        const picks = (pr as { picks_data?: Record<string, string> }).picks_data;
+        const cat = (pr as { category: string }).category;
+        if (!picks || typeof picks !== 'object') continue;
+        // New key overrides legacy
+        if (!picksByUser.has(uid) || cat === catKey) {
+          picksByUser.set(uid, picks);
+        }
+      }
 
-        const actualRank = rankByCountry.get(cc) ?? null;
-        const deviation = actualRank === null ? 99 : Math.abs(slot - actualRank);
-        let pts = 0;
-        if (deviation === 0) pts = getCfg(config, 'medal_table_exact');
-        else if (deviation === 1) pts = getCfg(config, 'medal_table_dev1');
-        else if (deviation === 2) pts = getCfg(config, 'medal_table_dev2');
-        else if (deviation === 3) pts = getCfg(config, 'medal_table_dev3');
-        total += pts;
-        lines.push({
-          slot,
-          country: cc,
-          predictedRank: slot,
-          actualRank,
-          deviation,
-          points: pts,
+      for (const [uid, picks] of picksByUser) {
+        const lines: MedalTableScoreLine[] = [];
+        let total = 0;
+
+        for (let slot = 1; slot <= MEDAL_TABLE_SLOTS; slot++) {
+          const cc = String(picks[String(slot)] || '').trim().toUpperCase();
+          if (!cc || cc === 'N/A') continue;
+
+          const actualRank = rankByCountry.get(cc) ?? null;
+          const deviation = actualRank === null ? 99 : Math.abs(slot - actualRank);
+          let pts = 0;
+          if (deviation === 0) pts = getCfg(config, 'medal_table_exact');
+          else if (deviation === 1) pts = getCfg(config, 'medal_table_dev1');
+          else if (deviation === 2) pts = getCfg(config, 'medal_table_dev2');
+          else if (deviation === 3) pts = getCfg(config, 'medal_table_dev3');
+          total += pts;
+          lines.push({
+            slot,
+            country: cc,
+            predictedRank: slot,
+            actualRank,
+            deviation,
+            points: pts,
+          });
+        }
+
+        const breakdown: MedalTableScoreBreakdown = {
+          lines,
+          categoryTotal: total,
+          maxPossible,
+        };
+        const filled = lines.length;
+        const correctSlots = lines.filter((l) => l.points > 0).length;
+
+        allScoreRows.push({
+          user_id: uid,
+          tournament_id: tournamentId,
+          category: catKey,
+          total_points: total,
+          correct_picks: correctSlots,
+          total_picks: filled,
+          breakdown,
         });
       }
-
-      const breakdown: MedalTableScoreBreakdown = {
-        lines,
-        categoryTotal: total,
-        maxPossible,
-      };
-      const filled = lines.length;
-      const correctSlots = lines.filter((l) => l.points > 0).length;
-
-      scoreRows.push({
-        user_id: uid,
-        tournament_id: tournamentId,
-        category: MEDAL_TABLE_CATEGORY,
-        total_points: total,
-        correct_picks: correctSlots,
-        total_picks: filled,
-        breakdown,
-      });
     }
 
-    if (scoreRows.length > 0) {
+    if (allScoreRows.length > 0) {
       const { error: upErr } = await supabase
         .from('tournament_scores')
-        .upsert(scoreRows, { onConflict: 'user_id,tournament_id,category' });
+        .upsert(allScoreRows, { onConflict: 'user_id,tournament_id,category' });
       if (upErr) throw upErr;
-      for (const row of scoreRows) {
-        await refreshProfilePointsFromAllScores(row.user_id);
+      const uniqueUsers = [...new Set(allScoreRows.map((r) => r.user_id))];
+      for (const uid of uniqueUsers) {
+        await refreshProfilePointsFromAllScores(uid);
       }
     }
 
-    return { success: true, usersScored: scoreRows.length };
+    return { success: true, usersScored: allScoreRows.length };
   } catch (err: any) {
     console.error('[scoringEngine] calculateMedalTableScores:', err);
     return { success: false, usersScored: 0, error: err?.message || String(err) };
@@ -669,7 +704,7 @@ export async function calculateBonusesAndMedalTable(
       .from('tournament_scores')
       .select('user_id, category, breakdown')
       .eq('tournament_id', tournamentId)
-      .not('category', 'in', '(_bonuses_,_medal_table_)');
+      .not('category', 'in', '(_bonuses_,_medal_table_total_,_medal_table_men_,_medal_table_women_,_medal_table_)');
 
     const { data: tournamentData } = await supabase
       .from('tournaments')

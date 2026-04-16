@@ -4,6 +4,7 @@ import { ViewState } from '../types';
 import { Mail, Lock, Eye, User, Award, AlertCircle, AtSign, Check, X, LogIn, UserPlus } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
+import { showToast } from '../lib/toast';
 
 interface LoginProps {
   onNavigate: (view: ViewState) => void;
@@ -94,7 +95,7 @@ const Login: React.FC<LoginProps> = ({ onNavigate }) => {
         if (signUpError) throw signUpError;
         
         if (data.user && data.session === null) {
-            alert("Account created! Please check your email to verify your account.");
+            showToast('success', "Account created! Please check your email to verify your account.");
             setIsRegistering(false);
         } else if (data.session) {
             onNavigate('HOME');

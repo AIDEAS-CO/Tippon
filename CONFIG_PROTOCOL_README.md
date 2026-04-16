@@ -374,6 +374,36 @@ ALTER TABLE public.tournament_scores
     FOREIGN KEY (tournament_id) REFERENCES public.tournaments(id) ON DELETE CASCADE;
 ```
 
+### Migration 008 — REQUIRED for per-category lock/reopen + medal table status + 3-way medal picks
+
+**Changes:**
+1. `medal_table_status` column on `tournaments` — controls whether medal table picks are locked.
+2. Rename existing `_medal_table_` pick/score rows to `_medal_table_total_` (backward compat).
+
+**Run this in Supabase Dashboard → SQL Editor:**
+
+```sql
+-- 1. Medal table status per tournament
+ALTER TABLE public.tournaments
+  ADD COLUMN IF NOT EXISTS medal_table_status TEXT NOT NULL DEFAULT 'open';
+
+-- 2. Rename legacy medal table picks to new Total key
+UPDATE public.user_picks
+  SET category = '_medal_table_total_'
+  WHERE category = '_medal_table_';
+
+UPDATE public.tournament_scores
+  SET category = '_medal_table_total_'
+  WHERE category = '_medal_table_';
+```
+
+After running:
+- Admin can lock/reopen medal table picks independently via `Lock Medal Table` / `Reopen` buttons.
+- Players see 3 tabs (Men/Women/Total) in medal table picks, each with 3 slots = 9 picks, 36 pts max.
+- Category `status` TEXT already accepts `'locked'` (3-state: open → locked → closed) from Migration 007.
+
+---
+
 ### Migration 007 — REQUIRED for per-category closing
 **Add `status` column to the `categories` table.**
 

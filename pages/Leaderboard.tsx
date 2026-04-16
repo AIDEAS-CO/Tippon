@@ -639,11 +639,15 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                               ? Math.round((catScore.correct_picks / catScore.total_picks) * 100)
                               : 0;
                             const categoryTitle =
-                              catScore.category === '_medal_table_'
-                                ? 'Medal table'
-                                : catScore.category === '_bonuses_'
-                                  ? 'Tournament bonuses'
-                                  : catScore.category;
+                              catScore.category === '_medal_table_men_'
+                                ? 'Medal table (Men)'
+                                : catScore.category === '_medal_table_women_'
+                                  ? 'Medal table (Women)'
+                                  : (catScore.category === '_medal_table_total_' || catScore.category === '_medal_table_')
+                                    ? 'Medal table (Total)'
+                                    : catScore.category === '_bonuses_'
+                                      ? 'Tournament bonuses'
+                                      : catScore.category;
 
                             if (isBonusBreakdown(rawBreakdown)) {
                               const bb = rawBreakdown;

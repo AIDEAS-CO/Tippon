@@ -6,6 +6,7 @@ import Flag from '../components/ui/Flag';
 import { supabase } from '../lib/supabaseClient';
 import { calculateMyScore } from '../lib/scoringEngine';
 import { getBracketParticipantCount, buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds, deriveStandings } from '../lib/bracketUtils';
+import { showToast } from '../lib/toast';
 
 interface BracketProps {
   onNavigate: (view: ViewState) => void;
@@ -17,6 +18,7 @@ interface BracketProps {
   userRole?: UserRole;
   onStatusChange?: (tournamentId: string, newStatus: string) => void;
   categoryStatuses?: Record<string, CategoryStatus>;
+  medalTableStatus?: 'open' | 'locked';
 }
 
 const BracketNode: React.FC<{
@@ -80,7 +82,7 @@ const BracketNode: React.FC<{
   );
 };
 
-const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tournament, existingPicks, onSavePicks, userId, userRole, onStatusChange, categoryStatuses }) => {
+const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tournament, existingPicks, onSavePicks, userId, userRole, onStatusChange, categoryStatuses, medalTableStatus = 'open' }) => {
   const [matches, setMatches] = useState<Match[]>([]);
   const [picks, setPicks] = useState<UserPicks>({});
   const [champion, setChampion] = useState<string | null>(null);
@@ -111,8 +113,10 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
 
   const isAdmin = userRole === 'ADMIN';
   const effectiveStatus = (localStatus || tournament?.status || '').toUpperCase();
-  const isCategoryClosed = !isAdmin && categoryStatuses?.[selectedCategory] === 'closed';
-  const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED' || isCategoryClosed;
+  const catStatus = categoryStatuses?.[selectedCategory];
+  const isCategoryLocked = !isAdmin && (catStatus === 'locked' || catStatus === 'closed');
+  const isCategoryClosed = !isAdmin && catStatus === 'closed';
+  const isReadOnly = effectiveStatus === 'LIVE' || effectiveStatus === 'COMPLETED' || isCategoryLocked;
   const showDragDrop = isAdmin && effectiveStatus !== 'LIVE' && effectiveStatus !== 'COMPLETED';
 
   const placedIds = useMemo(() => {
@@ -159,7 +163,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
         if (dbMatches && dbMatches.length > 0) {
           const bracketCategories = Array.from(
             new Set(dbMatches.map((m: any) => m.weight_category).filter(Boolean))
-          ) as string[];
+          ).sort() as string[];
 
           if (bracketCategories.length > 0) {
             setCategories(bracketCategories);
@@ -434,7 +438,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       onStatusChange?.(tournament.id, 'LIVE');
     } catch (err) {
       console.error('Error changing status to LIVE:', err);
-      alert('Error changing tournament status.');
+      showToast('error', 'Error changing tournament status.');
     }
   };
 
@@ -639,6 +643,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
                             className={`w-full text-left px-4 py-2 text-sm hover:bg-slate-50 flex items-center gap-2 ${selectedCategory === cat ? 'font-bold text-primary bg-blue-50' : 'text-slate-700'}`}
                           >
                             <span className="flex-1">{cat}</span>
+                            {categoryStatuses?.[cat] === 'locked' && <Lock size={12} className="text-amber-400 flex-shrink-0" />}
                             {categoryStatuses?.[cat] === 'closed' && <Lock size={12} className="text-slate-400 flex-shrink-0" />}
                           </button>
                         </li>
@@ -691,7 +696,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
             </>
           )}
 
-          {(effectiveStatus === 'DRAFT' || effectiveStatus === 'UPCOMING') && (
+          {(effectiveStatus === 'DRAFT' || effectiveStatus === 'UPCOMING') && medalTableStatus === 'open' && (
             <button
               type="button"
               onClick={() => onNavigate('MEDAL_TABLE_PICKS')}
@@ -700,6 +705,12 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
               <Medal size={16} />
               Medal table picks
             </button>
+          )}
+          {(effectiveStatus === 'DRAFT' || effectiveStatus === 'UPCOMING') && medalTableStatus === 'locked' && !isAdmin && (
+            <div className="flex items-center gap-2 px-3 py-2 bg-purple-50 text-purple-600 rounded-lg border border-purple-200 text-sm font-bold">
+              <Lock size={14} />
+              Medal picks locked
+            </div>
           )}
 
           {/* Sidebar toggle — only for admins building brackets */}
@@ -717,7 +728,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
             <div className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-500 rounded-lg border border-slate-200">
               <Lock size={16} />
               <span className="text-xs font-bold uppercase tracking-wide">
-                {isCategoryClosed ? `${selectedCategory} Closed` : 'Picks Locked'}
+                {isCategoryClosed ? `${selectedCategory} Closed` : catStatus === 'locked' ? `${selectedCategory} Locked` : 'Picks Locked'}
               </span>
             </div>
           ) : showSaved ? (

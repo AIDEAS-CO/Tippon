@@ -158,17 +158,22 @@ const MatchCard: React.FC<MatchCardProps> = ({
         <span className={resultStatus === 'correct' ? 'text-emerald-600' : resultStatus === 'incorrect' ? 'text-red-500' : 'text-blue-600'}>
           Match {match.matchNumber}
         </span>
-        {match.pool && (() => {
+        {match.round === 'SF' ? (
+          <span className="text-slate-500">Semi</span>
+        ) : match.round === 'F' ? (
+          <span className="text-slate-500">Final</span>
+        ) : match.round === 'B' ? (
+          <span className="text-slate-500">Bronze</span>
+        ) : match.pool ? (() => {
           const poolColorMap: Record<string, string> = {
             A: 'text-red-600',
             B: 'text-blue-600',
             C: 'text-green-600',
             D: 'text-yellow-500',
           };
-          const isColoredRound = match.round !== 'SF' && match.round !== 'F';
-          const colorClass = isColoredRound && poolColorMap[match.pool] ? poolColorMap[match.pool] : 'text-slate-400';
+          const colorClass = poolColorMap[match.pool] ?? 'text-slate-400';
           return <span className={colorClass}>Pool {match.pool}</span>;
-        })()}
+        })() : null}
       </div>
       {renderCompetitor(topCompetitor, true)}
       {renderCompetitor(bottomCompetitor, false)}

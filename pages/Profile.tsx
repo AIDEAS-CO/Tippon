@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
+import { showToast } from '../lib/toast';
 
 interface ProfileProps {
   onNavigate: (view: ViewState) => void;
@@ -105,7 +106,7 @@ const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfi
 
       } catch (error: any) {
           console.error("Upload error:", error);
-          alert('Error uploading image: ' + error.message);
+          showToast('error', 'Error uploading image: ' + error.message);
       } finally {
           setIsUploading(false);
       }
@@ -139,7 +140,7 @@ const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfi
           }, 1500);
 
       } catch (error: any) {
-          alert('Error updating profile: ' + error.message);
+          showToast('error', 'Error updating profile: ' + error.message);
       } finally {
           setIsSaving(false);
       }

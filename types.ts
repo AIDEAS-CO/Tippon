@@ -46,7 +46,7 @@ export interface TournamentCategories {
 }
 
 export type TournamentStatus = 'DRAFT' | 'LIVE' | 'UPCOMING' | 'COMPLETED' | 'SORTING';
-export type CategoryStatus = 'open' | 'closed';
+export type CategoryStatus = 'open' | 'locked' | 'closed';
 
 // Frontend Representation of a Tournament
 export interface Tournament {

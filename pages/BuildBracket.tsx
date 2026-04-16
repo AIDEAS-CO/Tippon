@@ -5,6 +5,7 @@ import Flag from '../components/ui/Flag';
 import Button from '../components/ui/Button';
 import { supabase } from '../lib/supabaseClient';
 import { getBracketParticipantCount } from '../lib/bracketUtils';
+import { showToast } from '../lib/toast';
 
 interface BuildBracketProps {
   onNavigate: (view: ViewState) => void;
@@ -69,7 +70,15 @@ Return a JSON array of objects, where each object represents a weight category f
 For each weight category, provide the 'weight' (e.g., '-100kg') and an array of 'matches' for the FIRST ROUND ONLY.
 The matches MUST be in the exact visual order they appear in the PDF (top to bottom, which corresponds to Pool A, then B, then C, then D).
 
-CRITICAL RULES:
+CRITICAL RULES — CATEGORY SEPARATION (most important):
+- Each weight category is a COMPLETELY SEPARATE bracket. NEVER mix athletes from one category into another.
+- Weight categories are separated by clear visual headers (e.g. "-60kg", "-73kg", "Men -81kg", "Women -57kg"). Each header starts a NEW independent bracket.
+- If the PDF has multiple pages, check the category header on each page — a new page usually means a new category.
+- An athlete listed under the "-60kg" header belongs ONLY to the "-60kg" bracket. Do not carry them into "-66kg" or any other category.
+- If you are unsure which category a match belongs to, use the nearest category header ABOVE it in the document.
+- Return one object per category. Each object must only contain matches from its own category.
+
+CRITICAL RULES — MATCH EXTRACTION:
 - If the category header shows a participant count in parentheses (e.g. "Seniors (32)", "(16 athletes)", "32"), set 'participant_count' to that integer. This is required to build the full first round (e.g. 32 athletes => 16 first-round matches).
 - For each first-round match, include 'pdf_match_number' as the small integer printed next to that match on the draw (1, 2, 3, ...). If not visible, omit it.
 - Each match has 'competitor1' and 'competitor2' (either may be null for a BYE or empty slot).
@@ -349,14 +358,14 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
 
   // --- Process single PDF ---
   const handleProcessSinglePDF = async () => {
-    if (!singleFile) return alert("Please upload a PDF first.");
-    if (!tournament) return alert("No tournament selected.");
+    if (!singleFile) { showToast('warning', 'Please upload a PDF first.'); return; }
+    if (!tournament) { showToast('warning', 'No tournament selected.'); return; }
 
     setIsProcessing(true);
     try {
       const tournamentIdNum = parseInt(String(tournament.id), 10);
       if (!Number.isFinite(tournamentIdNum) || tournamentIdNum <= 0) {
-        alert('Invalid tournament ID. Select the tournament again and retry.');
+        showToast('error', 'Invalid tournament ID. Select the tournament again and retry.');
         return;
       }
 
@@ -379,7 +388,7 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
       if (filteredData.length === 0) {
         const pdfCats = extractedData.map((c: any) => c.weight).join(', ');
         const confCats = configuredWeights.join(', ');
-        alert(`No matching categories found.\nPDF has: ${pdfCats}\nTournament expects: ${confCats}`);
+        showToast('warning', `No matching categories. PDF has: ${pdfCats} | Expected: ${confCats}`);
         return;
       }
 
@@ -393,7 +402,7 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
       setSelectedReviewCategory(categories[0]?.weight || '');
       setMode('review');
     } catch (error: any) {
-      alert("Error processing PDF: " + (error?.message || String(error)));
+      showToast('error', "Error processing PDF: " + (error?.message || String(error)));
     } finally {
       setIsProcessing(false);
     }
@@ -432,7 +441,7 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
   // Enter review from per-category uploads
   const handleReviewPerCategory = () => {
     if (extractedCategories.length === 0) {
-      alert('Upload and process at least one category PDF first.');
+      showToast('warning', 'Upload and process at least one category PDF first.');
       return;
     }
     setSelectedReviewCategory(extractedCategories[0]?.weight || '');
@@ -442,7 +451,7 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
   // Enter review from manual mode
   const handleStartManualBracket = () => {
     if (allConfiguredCategories.length === 0) {
-      alert('No categories configured for this tournament.');
+      showToast('warning', 'No categories configured for this tournament.');
       return;
     }
     // Build empty match structure from roster counts
@@ -469,7 +478,7 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
     try {
       const tournamentIdNum = parseInt(String(tournament.id), 10);
       if (!Number.isFinite(tournamentIdNum) || tournamentIdNum <= 0) {
-        alert('Invalid tournament ID.');
+        showToast('error', 'Invalid tournament ID.');
         return;
       }
 
@@ -500,10 +509,10 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
 
       await supabase.from('tournaments').update({ status: 'upcoming' }).eq('id', tournamentIdNum);
 
-      alert(`Brackets saved! ${matchesToInsert.length} matches across ${extractedCategories.length} categories.`);
+      showToast('success', `Brackets saved! ${matchesToInsert.length} matches across ${extractedCategories.length} categories.`);
       onNavigate('BRACKET');
     } catch (error: any) {
-      alert("Error saving brackets: " + (error?.message || String(error)));
+      showToast('error', "Error saving brackets: " + (error?.message || String(error)));
     } finally {
       setIsSaving(false);
     }
@@ -624,18 +633,34 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
               return acc;
             }, 0);
             return (
-              <button
-                key={cat.weight}
-                onClick={() => setSelectedReviewCategory(cat.weight)}
-                className={`px-4 py-3 text-sm font-bold border-b-2 whitespace-nowrap transition-colors ${
-                  selectedReviewCategory === cat.weight
-                    ? 'border-blue-600 text-blue-600'
-                    : 'border-transparent text-slate-500 hover:text-slate-700'
-                }`}
-              >
-                {cat.weight}
-                <span className="ml-1.5 text-xs font-normal opacity-70">({count})</span>
-              </button>
+              <div key={cat.weight} className="flex items-center gap-1">
+                <button
+                  onClick={() => setSelectedReviewCategory(cat.weight)}
+                  className={`px-4 py-3 text-sm font-bold border-b-2 whitespace-nowrap transition-colors ${
+                    selectedReviewCategory === cat.weight
+                      ? 'border-blue-600 text-blue-600'
+                      : 'border-transparent text-slate-500 hover:text-slate-700'
+                  }`}
+                >
+                  {cat.weight}
+                  <span className="ml-1.5 text-xs font-normal opacity-70">({count})</span>
+                </button>
+                <button
+                  onClick={() => {
+                    if (!confirm(`Remove "${cat.weight}" from this batch?`)) return;
+                    const remaining = extractedCategories.filter(c => c.weight !== cat.weight);
+                    setExtractedCategories(remaining);
+                    if (selectedReviewCategory === cat.weight) {
+                      setSelectedReviewCategory(remaining[0]?.weight || '');
+                    }
+                    if (remaining.length === 0) setMode('upload');
+                  }}
+                  className="p-1 text-slate-300 hover:text-red-500 transition-colors"
+                  title="Remove category"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
             );
           })}
         </div>

@@ -309,7 +309,7 @@ export function deriveStandings(matches: Match[], picks: Record<string, string>)
     if (wId) push(7, rm.competitor1?.id === wId ? rm.competitor2 : rm.competitor1);
   }
 
-  return out;
+  return out.sort((a, b) => a.position - b.position);
 }
 
 /**

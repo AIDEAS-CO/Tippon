@@ -6,6 +6,7 @@ import Flag from '../components/ui/Flag';
 import * as XLSX from 'xlsx';
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
+import { showToast } from '../lib/toast';
 
 // Common Judo Nations for Autocomplete
 const JUDO_COUNTRIES = [
@@ -339,9 +340,8 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
 
         console.log("Saved successfully!");
         
-        // Explicit alert as requested for visual debug confirmation
         if (dbStatus === 'draft') {
-            alert("Saved successfully! Draft and categories updated.");
+            showToast('success', 'Saved successfully! Draft and categories updated.');
         }
 
         // UI Feedback Logic
@@ -370,7 +370,7 @@ const BracketBuilder: React.FC<BracketBuilderProps> = ({ onNavigate, tournament,
 
     } catch (err: any) {
         console.error("CRITICAL SAVE ERROR:", err);
-        alert("Critical save error: " + (err.message || JSON.stringify(err)));
+        showToast('error', "Critical save error: " + (err.message || JSON.stringify(err)));
         setUploadError("Error saving to database: " + err.message);
     } finally {
         setUploadState('idle');

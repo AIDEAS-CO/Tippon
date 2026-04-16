@@ -18,9 +18,11 @@ import TournamentFinalResults from './pages/TournamentFinalResults';
 import Leaderboard from './pages/Leaderboard';
 import Profile from './pages/Profile';
 import Navigation from './components/Navigation';
+import Toast from './components/ui/Toast';
 import { ViewState, UserRole, Tournament, UserPicks, Competitor, UserProfile, CategoryStatus } from './types';
 import { supabase } from './lib/supabaseClient';
 import { calculateBonusesAndMedalTable } from './lib/scoringEngine';
+import { showToast } from './lib/toast';
 
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewState>('LOGIN');
@@ -44,8 +46,11 @@ const App: React.FC = () => {
   // Store user picks: Record<TournamentId, Record<CategoryName, UserPicks>>
   const [allUserPicks, setAllUserPicks] = useState<Record<string, Record<string, UserPicks>>>({});
 
-  // Per-category open/closed status: Record<categoryName, CategoryStatus>
+  // Per-category open/locked/closed status: Record<categoryName, CategoryStatus>
   const [categoryStatuses, setCategoryStatuses] = useState<Record<string, CategoryStatus>>({});
+
+  // Medal table picks lock status for selected tournament
+  const [medalTableStatus, setMedalTableStatus] = useState<'open' | 'locked'>('open');
 
   // Unified User Stats (Simulating Database for Leaderboard view mock)
   const [userStats] = useState({
@@ -367,10 +372,8 @@ const App: React.FC = () => {
         // If we get a FK constraint error here it means Migration 006 has not been
         // run yet in Supabase. Direct the admin to run it.
         if (error.code === '23503') {
-          alert(
-            'Cannot delete this tournament because other users have picks saved for it.\n\n' +
-            'To fix this permanently, run Migration 006 in your Supabase Dashboard → SQL Editor.\n' +
-            'See CONFIG_PROTOCOL_README.md → Migrations → Migration 006.'
+          showToast('error',
+            'Cannot delete: other users have picks for this tournament. Run Migration 006 in Supabase to fix permanently.'
           );
           return;
         }
@@ -379,7 +382,7 @@ const App: React.FC = () => {
       setTournaments(prev => prev.filter(tour => tour.id !== t.id));
     } catch (err: any) {
       console.error("Error deleting tournament:", err);
-      alert("Error deleting tournament: " + (err?.message || String(err)));
+      showToast('error', "Error deleting tournament: " + (err?.message || String(err)));
     }
   };
 
@@ -417,6 +420,88 @@ const App: React.FC = () => {
       map[row.name] = (row.status as CategoryStatus) || 'open';
     }
     setCategoryStatuses(map);
+
+    // Load medal table status
+    const { data: tData } = await supabase
+      .from('tournaments')
+      .select('medal_table_status')
+      .eq('id', tournamentId)
+      .single();
+    setMedalTableStatus((tData?.medal_table_status as 'open' | 'locked') || 'open');
+  };
+
+  const handleCategoryLock = async (tournamentId: string, categoryName: string) => {
+    const { error } = await supabase
+      .from('categories')
+      .update({ status: 'locked' })
+      .eq('tournament_id', tournamentId)
+      .eq('name', categoryName);
+    if (error) {
+      console.error('[handleCategoryLock] DB error:', error);
+      showToast('error', 'Error locking category picks.');
+      return;
+    }
+    setCategoryStatuses(prev => ({ ...prev, [categoryName]: 'locked' }));
+    // If any category is now locked/closed, tournament should be LIVE
+    handleStatusChange(tournamentId, 'LIVE');
+    await supabase.from('tournaments').update({ status: 'live' }).eq('id', tournamentId);
+    fetchTournaments();
+    showToast('success', `Picks locked for "${categoryName}".`);
+  };
+
+  const handleCategoryReopen = async (tournamentId: string, categoryName: string) => {
+    const { error } = await supabase
+      .from('categories')
+      .update({ status: 'open' })
+      .eq('tournament_id', tournamentId)
+      .eq('name', categoryName);
+    if (error) {
+      console.error('[handleCategoryReopen] DB error:', error);
+      showToast('error', 'Error reopening category picks.');
+      return;
+    }
+    setCategoryStatuses(prev => ({ ...prev, [categoryName]: 'open' }));
+
+    // Check if ALL categories are now open → revert tournament to UPCOMING
+    const { data: allCats } = await supabase
+      .from('categories')
+      .select('name, status')
+      .eq('tournament_id', tournamentId);
+    const allOpen = (allCats || []).every(c => c.name === categoryName || c.status === 'open');
+    if (allOpen) {
+      await supabase.from('tournaments').update({ status: 'upcoming' }).eq('id', tournamentId);
+      handleStatusChange(tournamentId, 'UPCOMING');
+      fetchTournaments();
+    }
+    showToast('success', `Picks reopened for "${categoryName}".`);
+  };
+
+  const handleMedalTableLock = async (tournamentId: string) => {
+    const { error } = await supabase
+      .from('tournaments')
+      .update({ medal_table_status: 'locked' })
+      .eq('id', tournamentId);
+    if (error) {
+      console.error('[handleMedalTableLock] DB error:', error);
+      showToast('error', 'Error locking medal table picks.');
+      return;
+    }
+    setMedalTableStatus('locked');
+    showToast('success', 'Medal table picks locked.');
+  };
+
+  const handleMedalTableReopen = async (tournamentId: string) => {
+    const { error } = await supabase
+      .from('tournaments')
+      .update({ medal_table_status: 'open' })
+      .eq('id', tournamentId);
+    if (error) {
+      console.error('[handleMedalTableReopen] DB error:', error);
+      showToast('error', 'Error reopening medal table picks.');
+      return;
+    }
+    setMedalTableStatus('open');
+    showToast('success', 'Medal table picks reopened.');
   };
 
   const handleCategoryClose = async (tournamentId: string, categoryName: string) => {
@@ -456,6 +541,33 @@ const App: React.FC = () => {
         fetchTournaments();
         setTimeout(() => setCurrentView('TOURNAMENT_LEADERBOARD'), 1500);
       }
+    }
+  };
+
+  const handleDeleteCategory = async (tournamentId: string, categoryName: string) => {
+    if (!confirm(`Delete category "${categoryName}"? This will remove all brackets, picks, and scores for this category.`)) return;
+    try {
+      // Delete in dependency order
+      await supabase.from('tournament_scores').delete().eq('tournament_id', tournamentId).eq('category', categoryName);
+      await supabase.from('match_results').delete().eq('tournament_id', tournamentId).eq('category', categoryName);
+      await supabase.from('user_picks').delete().eq('tournament_id', tournamentId).eq('category', categoryName);
+      await supabase.from('competition_brackets').delete().eq('tournament_id', tournamentId).eq('weight_category', categoryName);
+      const { error } = await supabase.from('categories').delete().eq('tournament_id', tournamentId).eq('name', categoryName);
+      if (error) throw error;
+
+      // Remove from local categoryStatuses
+      setCategoryStatuses(prev => {
+        const next = { ...prev };
+        delete next[categoryName];
+        return next;
+      });
+
+      // Refresh tournament data
+      await fetchTournaments();
+      showToast('success', `Category "${categoryName}" deleted.`);
+    } catch (err: any) {
+      console.error('[handleDeleteCategory] error:', err);
+      showToast('error', 'Error deleting category: ' + (err?.message || String(err)));
     }
   };
 
@@ -587,6 +699,7 @@ const App: React.FC = () => {
             userRole={userRole}
             onStatusChange={handleStatusChange}
             categoryStatuses={categoryStatuses}
+            medalTableStatus={medalTableStatus}
         />;
       case 'MEDAL_TABLE_PICKS':
         return (
@@ -595,6 +708,7 @@ const App: React.FC = () => {
             tournament={selectedTournament}
             userId={userProfile?.id}
             onSavePicks={handleSavePicks}
+            medalTableStatus={medalTableStatus}
           />
         );
       case 'ROSTER':
@@ -621,6 +735,12 @@ const App: React.FC = () => {
             }}
             categoryStatuses={categoryStatuses}
             onCategoryClose={handleCategoryClose}
+            onCategoryDelete={handleDeleteCategory}
+            onCategoryLock={handleCategoryLock}
+            onCategoryReopen={handleCategoryReopen}
+            onMedalTableLock={handleMedalTableLock}
+            onMedalTableReopen={handleMedalTableReopen}
+            medalTableStatus={medalTableStatus}
         />;
       case 'TOURNAMENT_LEADERBOARD':
         return <Leaderboard 
@@ -681,10 +801,11 @@ const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen bg-background-light">
+      <Toast />
       {currentView !== 'BUILD_BRACKET' && currentView !== 'MANAGE_ROSTER' && currentView !== 'TOURNAMENT_RESULTS' && (
-        <Navigation 
-            currentView={currentView} 
-            onNavigate={setCurrentView} 
+        <Navigation
+            currentView={currentView}
+            onNavigate={setCurrentView}
             userProfile={userProfile}
         />
       )}

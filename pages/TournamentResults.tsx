@@ -7,7 +7,7 @@ import Flag from '../components/ui/Flag';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   ArrowLeft, ChevronDown, Loader2, Trophy, CheckCircle, Calculator,
-  Lock, AlertCircle, Check, FileUp, Upload, X,
+  Lock, AlertCircle, Check, FileUp, Upload, X, Trash2,
 } from 'lucide-react';
 import { buildMatchesForBracket, deriveStandings, sortedUniqueRounds } from '../lib/bracketUtils';
 import { computeCountryMedalRanking } from '../lib/countryMedalRanking';
@@ -340,6 +340,12 @@ interface TournamentResultsProps {
   onTournamentUpdated?: () => void;
   categoryStatuses?: Record<string, CategoryStatus>;
   onCategoryClose?: (tournamentId: string, categoryName: string) => Promise<void>;
+  onCategoryDelete?: (tournamentId: string, categoryName: string) => Promise<void>;
+  onCategoryLock?: (tournamentId: string, categoryName: string) => Promise<void>;
+  onCategoryReopen?: (tournamentId: string, categoryName: string) => Promise<void>;
+  onMedalTableLock?: (tournamentId: string) => Promise<void>;
+  onMedalTableReopen?: (tournamentId: string) => Promise<void>;
+  medalTableStatus?: 'open' | 'locked';
 }
 
 const TournamentResults: React.FC<TournamentResultsProps> = ({
@@ -348,6 +354,12 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   onTournamentUpdated,
   categoryStatuses,
   onCategoryClose,
+  onCategoryDelete,
+  onCategoryLock,
+  onCategoryReopen,
+  onMedalTableLock,
+  onMedalTableReopen,
+  medalTableStatus = 'open',
 }) => {
   const [matches, setMatches] = useState<Match[]>([]);
   const [results, setResults] = useState<Record<string, string>>({});
@@ -393,7 +405,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
 
       const bracketCategories = Array.from(
         new Set(dbMatches.map((m: any) => m.weight_category).filter(Boolean))
-      ) as string[];
+      ).sort() as string[];
 
       if (bracketCategories.length > 0) {
         setCategories(bracketCategories);
@@ -905,21 +917,86 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
             Save Results
           </button>
 
-          {/* Close current category — scores & locks picks for this category */}
-          {selectedCategory && categoryStatuses?.[selectedCategory] !== 'closed' && (
+          {/* Per-category pick lock/reopen */}
+          {selectedCategory && categoryStatuses?.[selectedCategory] === 'open' && onCategoryLock && (
+            <button
+              onClick={() => onCategoryLock(tournament!.id, selectedCategory)}
+              className="bg-amber-500 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-amber-600 transition-colors text-sm"
+            >
+              <Lock size={16} />
+              Lock Picks
+            </button>
+          )}
+          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 text-amber-700 rounded-lg border border-amber-200 text-sm font-bold">
+                <Lock size={14} />
+                Picks Locked
+              </div>
+              {onCategoryReopen && (
+                <button
+                  onClick={() => onCategoryReopen(tournament!.id, selectedCategory)}
+                  className="text-amber-600 border border-amber-300 bg-white px-3 py-2 rounded-lg font-bold text-sm hover:bg-amber-50 transition-colors"
+                >
+                  Reopen
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Close current category — scores & finalizes this category */}
+          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
             <button
               onClick={() => handleCloseCategory(selectedCategory)}
               disabled={isClosingCategory}
-              className="bg-amber-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-amber-700 transition-colors text-sm disabled:opacity-50"
+              className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-emerald-700 transition-colors text-sm disabled:opacity-50"
             >
-              {isClosingCategory ? <Loader2 className="animate-spin" size={16} /> : <Lock size={16} />}
-              Close {selectedCategory}
+              {isClosingCategory ? <Loader2 className="animate-spin" size={16} /> : <Calculator size={16} />}
+              Score & Close
             </button>
           )}
           {selectedCategory && categoryStatuses?.[selectedCategory] === 'closed' && (
             <div className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-500 rounded-lg border border-slate-200 text-sm font-bold">
               <Lock size={14} />
               {selectedCategory} closed
+            </div>
+          )}
+
+          {/* Delete current category */}
+          {selectedCategory && categoryStatuses?.[selectedCategory] !== 'closed' && onCategoryDelete && (
+            <button
+              onClick={() => onCategoryDelete(tournament!.id, selectedCategory)}
+              className="bg-red-50 text-red-600 border border-red-200 px-3 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-red-100 transition-colors text-sm"
+            >
+              <Trash2 size={15} />
+              Delete
+            </button>
+          )}
+
+          {/* Medal table picks lock/reopen */}
+          {medalTableStatus === 'open' && onMedalTableLock && (
+            <button
+              onClick={() => onMedalTableLock(tournament!.id)}
+              className="bg-purple-600 text-white px-3 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-purple-700 transition-colors text-sm"
+            >
+              <Lock size={15} />
+              Lock Medal Table
+            </button>
+          )}
+          {medalTableStatus === 'locked' && (
+            <div className="flex items-center gap-1">
+              <div className="flex items-center gap-2 px-3 py-2 bg-purple-50 text-purple-700 rounded-lg border border-purple-200 text-sm font-bold">
+                <Lock size={14} />
+                Medal Table Locked
+              </div>
+              {onMedalTableReopen && (
+                <button
+                  onClick={() => onMedalTableReopen(tournament!.id)}
+                  className="text-purple-600 border border-purple-300 bg-white px-3 py-2 rounded-lg font-bold text-sm hover:bg-purple-50 transition-colors"
+                >
+                  Reopen
+                </button>
+              )}
             </div>
           )}
 
