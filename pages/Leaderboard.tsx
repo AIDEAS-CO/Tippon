@@ -406,9 +406,17 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
          </div>
       </div>
 
+      {/* Preview banner — shown when tournament scores are not yet final */}
+      {viewMode === 'tournament' && tournament && tournament.status?.toUpperCase() !== 'COMPLETED' && (
+        <div className="flex items-center gap-3 px-4 py-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-sm font-medium">
+          <span className="shrink-0 bg-amber-200 text-amber-900 text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-wide">Preview</span>
+          Scores shown are estimates — not all categories have been finalized yet. Final scores may change.
+        </div>
+      )}
+
       {/* Main Content */}
       <div className="space-y-6">
-        
+
         {/* Podium Section - Top 3 (Only visible when not searching) */}
         {showPodium && (
             <div className="bg-white pb-8 pt-4 px-4 rounded-3xl shadow-zen border border-slate-100 animate-fade-in-up stagger-1">

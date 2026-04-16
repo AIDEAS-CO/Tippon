@@ -373,6 +373,8 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   const [isClosing, setIsClosing] = useState(false);
   const [isClosingCategory, setIsClosingCategory] = useState(false);
   const [isPreviewingScores, setIsPreviewingScores] = useState(false);
+  const [previewScores, setPreviewScores] = useState<{ userName: string; points: number }[] | null>(null);
+  const [previewCategory, setPreviewCategory] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // PDF extraction state
@@ -733,10 +735,36 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   const handlePreviewScores = async (categoryName: string) => {
     if (!tournament?.id) return;
     setIsPreviewingScores(true);
+    setPreviewScores(null);
+    setPreviewCategory(null);
     setMessage({ type: 'info', text: `Calculating preview scores for ${categoryName}...` });
     try {
       const result = await calculateScores(tournament.id, categoryName);
       if (result.success) {
+        // Fetch saved scores + profile names for display
+        const { data: scoreRows } = await supabase
+          .from('tournament_scores')
+          .select('user_id, total_points')
+          .eq('tournament_id', tournament.id)
+          .eq('category', categoryName)
+          .order('total_points', { ascending: false });
+        const userIds = (scoreRows || []).map((r: any) => r.user_id);
+        let nameMap: Record<string, string> = {};
+        if (userIds.length > 0) {
+          const { data: profiles } = await supabase
+            .from('profiles')
+            .select('id, full_name, username')
+            .in('id', userIds);
+          for (const p of profiles || []) {
+            nameMap[p.id] = p.full_name || p.username || p.id.slice(0, 8);
+          }
+        }
+        const rows = (scoreRows || []).map((r: any) => ({
+          userName: nameMap[r.user_id] || r.user_id.slice(0, 8),
+          points: r.total_points || 0,
+        }));
+        setPreviewScores(rows);
+        setPreviewCategory(categoryName);
         setMessage({ type: 'success', text: `Preview scores calculated for "${categoryName}". Category remains open.` });
       } else {
         setMessage({ type: 'error', text: result.error || 'Error calculating preview scores.' });
@@ -1057,6 +1085,37 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
            <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />}
           <span className="flex-1 whitespace-pre-line">{message.text}</span>
           <button onClick={() => setMessage(null)} className="flex-shrink-0"><X size={14} /></button>
+        </div>
+      )}
+
+      {/* Preview Scores Panel */}
+      {previewScores && previewCategory && (
+        <div className="mx-4 mt-3 p-4 bg-white rounded-xl border border-blue-200 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Calculator size={16} className="text-blue-600" />
+              <h3 className="font-bold text-slate-800">Preview Scores — {previewCategory}</h3>
+              <span className="bg-amber-100 text-amber-800 text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-wide">Preview · Not Final</span>
+            </div>
+            <button onClick={() => { setPreviewScores(null); setPreviewCategory(null); }} className="text-slate-400 hover:text-slate-600">
+              <X size={18} />
+            </button>
+          </div>
+          <p className="text-xs text-slate-500 mb-3">Category is still open. These scores will update when results change.</p>
+          <div className="divide-y divide-slate-100">
+            {previewScores.map((row, i) => (
+              <div key={i} className="flex items-center justify-between py-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-400 font-bold w-5 text-right">{i + 1}</span>
+                  <span className="text-sm font-semibold text-slate-800">{row.userName}</span>
+                </div>
+                <span className="text-sm font-black text-blue-700">{row.points} pts</span>
+              </div>
+            ))}
+            {previewScores.length === 0 && (
+              <p className="text-sm text-slate-400 py-2">No scores yet — make sure results are saved for this category.</p>
+            )}
+          </div>
         </div>
       )}
 
