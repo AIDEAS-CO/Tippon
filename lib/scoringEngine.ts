@@ -12,7 +12,7 @@ import {
   Match,
 } from '../types';
 import { buildMatchesForBracket, deriveStandings, getQFParticipants } from './bracketUtils';
-import { weightsMatch } from './rankings';
+import { weightsMatch, lookupByWeight } from './rankings';
 import { computeCountryMedalRanking, countryRanksFromMedalRows } from './countryMedalRanking';
 import { MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL } from './tournamentConstants';
 
@@ -181,6 +181,15 @@ export function scoreCategory(
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 
+/** Cache of the user's total points on `profiles.points` (sum of all tournament_scores rows). */
+async function refreshProfilePointsFromAllScores(userId: string) {
+  const { data: allScores } = await supabase.from('tournament_scores').select('total_points').eq('user_id', userId);
+  if (allScores) {
+    const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
+    await supabase.from('profiles').update({ points: globalPoints }).eq('id', userId);
+  }
+}
+
 async function loadBracketForCategory(tournamentId: string | number, category: string, hasRepechage: boolean) {
   const [{ data: dbMatches }, { data: roster }] = await Promise.all([
     supabase.from('competition_brackets').select('*')
@@ -209,7 +218,7 @@ async function loadBracketForCategory(tournamentId: string | number, category: s
 
 /**
  * Scores all users for one category and upserts to tournament_scores.
- * Requires an open RLS policy on user_picks (see SUPABASE_MIGRATION.sql).
+ * Requires admin read on user_picks (Migration 009) and admin write on tournament_scores (Migration 010).
  */
 export async function calculateScores(
   tournamentId: string | number,
@@ -291,16 +300,7 @@ export async function calculateScores(
       if (upsertErr) throw upsertErr;
 
       // Update global profile points
-      for (const row of scoreRows) {
-        const { data: allScores } = await supabase
-          .from('tournament_scores')
-          .select('total_points')
-          .eq('user_id', row.user_id);
-        if (allScores) {
-          const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
-          await supabase.from('profiles').update({ points: globalPoints }).eq('id', row.user_id);
-        }
-      }
+      for (const row of scoreRows) await refreshProfilePointsFromAllScores(row.user_id);
     }
 
     const categoryResults: ScoringCategoryResult[] = scoreRows.map((row) => ({
@@ -377,14 +377,7 @@ export async function calculateMyScore(
     );
 
     // Update global profile points
-    const { data: allScores } = await supabase
-      .from('tournament_scores')
-      .select('total_points')
-      .eq('user_id', userId);
-    if (allScores) {
-      const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
-      await supabase.from('profiles').update({ points: globalPoints }).eq('id', userId);
-    }
+    await refreshProfilePointsFromAllScores(userId);
 
     return {
       points: total,
@@ -514,24 +507,17 @@ const MEDAL_TABLE_SLOTS = 3;
 /**
  * Split categories for the Men/Women medal tables. Only exact 'Male'/'Female' gender
  * counts; 'Mixed' (e.g. Mixed Teams) and unknown categories appear only in Total.
+ * Bracket labels are matched to `categories.name` by weight (`lookupByWeight`).
  */
 export function splitMedalTableCategories(
   categories: string[],
   catGenderMap: Map<string, string>
 ): { menCats: string[]; womenCats: string[]; totalCats: string[] } {
   return {
-    menCats: categories.filter((c) => catGenderMap.get(c) === 'Male'),
-    womenCats: categories.filter((c) => catGenderMap.get(c) === 'Female'),
+    menCats: categories.filter((c) => lookupByWeight(catGenderMap, c) === 'Male'),
+    womenCats: categories.filter((c) => lookupByWeight(catGenderMap, c) === 'Female'),
     totalCats: categories,
   };
-}
-
-async function refreshProfilePointsFromAllScores(userId: string) {
-  const { data: allScores } = await supabase.from('tournament_scores').select('total_points').eq('user_id', userId);
-  if (allScores) {
-    const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
-    await supabase.from('profiles').update({ points: globalPoints }).eq('id', userId);
-  }
 }
 
 /**
@@ -749,16 +735,7 @@ export async function calculateAllCategoryScores(
         .upsert(bonusRows, { onConflict: 'user_id,tournament_id,category' });
       if (bonusErr) console.error('[scoringEngine] bonus upsert:', bonusErr);
 
-      for (const row of bonusRows) {
-        const { data: allScores } = await supabase
-          .from('tournament_scores')
-          .select('total_points')
-          .eq('user_id', row.user_id);
-        if (allScores) {
-          const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
-          await supabase.from('profiles').update({ points: globalPoints }).eq('id', row.user_id);
-        }
-      }
+      for (const row of bonusRows) await refreshProfilePointsFromAllScores(row.user_id);
     }
   }
 
@@ -820,16 +797,7 @@ export async function calculateBonusesAndMedalTable(
         await supabase
           .from('tournament_scores')
           .upsert(bonusRows, { onConflict: 'user_id,tournament_id,category' });
-        for (const row of bonusRows) {
-          const { data: allScores } = await supabase
-            .from('tournament_scores')
-            .select('total_points')
-            .eq('user_id', row.user_id);
-          if (allScores) {
-            const globalPoints = allScores.reduce((s: number, r: any) => s + (r.total_points || 0), 0);
-            await supabase.from('profiles').update({ points: globalPoints }).eq('id', row.user_id);
-          }
-        }
+        for (const row of bonusRows) await refreshProfilePointsFromAllScores(row.user_id);
       }
     }
     return { success: true };

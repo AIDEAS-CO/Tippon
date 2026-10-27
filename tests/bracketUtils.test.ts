@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildMatchesForBracket, deriveStandings, getQFParticipants, simulateBracket } from '../lib/bracketUtils';
+import { buildMatchesForBracket, deriveStandings, getQFParticipants, simulateBracket, resolveBracket } from '../lib/bracketUtils';
 
 const ath = (n: number) => ({ id: `a${n}`, name: `ATH ${n}`, country: `C${n}` });
 
@@ -79,5 +79,26 @@ describe('byes and stale winners', () => {
     const picks: Record<string, string> = {};
     for (let i = 0; i < 8; i++) picks[`m${i + 1}`] = `a${2 * i + 1}`;
     expect(getQFParticipants(ms, picks).sort()).toEqual(['a1', 'a11', 'a13', 'a15', 'a3', 'a5', 'a7', 'a9']);
+  });
+});
+
+describe('resolveBracket', () => {
+  it('propagates winners and drops downstream picks invalidated by a changed winner', () => {
+    const ms = buildMatchesForBracket(rows(4), {}, '-73kg'); // 8 athletes: R1 (4) → SF (2) → F
+    const sf0 = ms.find((m) => m.round === 'SF' && m.nextMatchSlot === 1)!;
+    const final = ms.find((m) => m.round === 'F')!;
+    const picks = { m1: 'a1', m2: 'a3', [sf0.id]: 'a1', [final.id]: 'a1', additional_pick: 'a5' };
+
+    const ok = resolveBracket(ms, picks);
+    expect(ok.picks).toEqual(picks);
+    expect(ok.matches.find((m) => m.id === sf0.id)?.competitor1?.id).toBe('a1');
+
+    // Changing R1 m1 to a2 invalidates the SF and Final picks of a1; other keys stay
+    const changed = resolveBracket(ok.matches, { ...ok.picks, m1: 'a2' });
+    expect(changed.picks[sf0.id]).toBeUndefined();
+    expect(changed.picks[final.id]).toBeUndefined();
+    expect(changed.picks.m2).toBe('a3');
+    expect(changed.picks.additional_pick).toBe('a5');
+    expect(changed.matches.find((m) => m.id === sf0.id)?.competitor1?.id).toBe('a2');
   });
 });

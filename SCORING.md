@@ -99,26 +99,26 @@ Deviation per predicted country:
 | 3 | `medal_table_dev3` | **1** |
 | 4+ | — | 0 |
 
-Stored as a special category `'_medal_table_'` in `user_picks`.
+Three tables (3 rank slots each), stored in `user_picks` as categories `_medal_table_men_`, `_medal_table_women_`, `_medal_table_total_` (legacy `_medal_table_` rows are read as Total).
 
 **Men / Women / Total:** Men and Women tables only include categories whose `categories.gender` is exactly `Male` / `Female`. **Mixed** categories (e.g. Mixed Teams) count only toward **Total** (`splitMedalTableCategories`). In Teams brackets the competitors are countries; when a competitor has no `country`, a 3-letter competitor name is used as the country code.
 
-**Actual ranking:** Countries are ordered by total gold, then silver, then bronze (aggregated from final standings across all weight categories — see `lib/countryMedalRanking.ts`). For each filled rank slot `1`…`10`, deviation = `|predicted rank − actual rank|` for that country code.
+**Actual ranking:** Countries are ordered by total gold, then silver, then bronze (aggregated from final standings across all weight categories — see `lib/countryMedalRanking.ts`). For each filled rank slot `1`…`3`, deviation = `|predicted rank − actual rank|` for that country code.
 
-**Persisted score:** On finalize, `calculateMedalTableScores` writes `tournament_scores` with `category = '_medal_table_'` and `breakdown` of type `MedalTableScoreBreakdown` (`lines`, `categoryTotal`, `maxPossible`).
+**Persisted score:** On finalize, `calculateMedalTableScores` writes one `tournament_scores` row per table (`_medal_table_men_` / `_women_` / `_total_`, max 12 pts each by default) with `breakdown` of type `MedalTableScoreBreakdown` (`lines`, `categoryTotal`, `maxPossible`).
 
 ---
 
 ## Bonuses
 
-Calculated after all **weight** categories are scored. Batch order: weight categories → medal table (`'_medal_table_'`) → bonuses (`'_bonuses_'`). Bonus rules use only per–weight-class `ScoringBreakdown` results, not the medal table row.
+Calculated after all **weight** categories are scored. Batch order: weight categories → medal tables (`_medal_table_men_` / `_women_` / `_total_`) → bonuses (`'_bonuses_'`). Bonus rules use only per–weight-class `ScoringBreakdown` results, not the medal table row.
 
 | Rule ID | Description | Default Pts |
 |---------|-------------|:-----------:|
-| `bonus_perfect_weight` | All 4 medalists (G, S, B×2) exactly correct in **any one category** | **10** |
-| `bonus_majority_champs` | >50% of Gold predictions correct across **all categories** | **8** |
-| `bonus_10_additional` | 10+ Additional Picks correct across **all categories** | **6** |
-| `bonus_all_pools` | All 8 QF participants correct in **every category** | **5** |
+| `bonus_perfect_weight` | All 4 medalists (G, S, B×2) exactly correct — awarded **per category** where this happens | **10** each |
+| `bonus_majority_champs` | Exact gold in **more than 50%** of the categories the user has picks in | **8** |
+| `bonus_10_additional` | Additional pick scores in at least `ceil(70%)` of all weight categories | **6** |
+| `bonus_all_pools` | All QF participants correct — awarded **per category** where this happens | **5** each |
 
 Bonuses are stored as category `'_bonuses_'` in `tournament_scores`.
 
@@ -132,7 +132,7 @@ Bonuses are stored as category `'_bonuses_'` in `tournament_scores`.
 | Bronze | 8 |
 | Pool Finals | 8 |
 | Additional Pick | 2 |
-| **Category Total** | **30** |
+| **Category Total** | **30** (+ golden match points, if any) |
 
 ---
 
@@ -140,9 +140,9 @@ Bonuses are stored as category `'_bonuses_'` in `tournament_scores`.
 
 **Per-tournament (recommended):** Admin goes to tournament Step 2 (Scoring Rules) → adjust values in the UI.
 
-**Change defaults globally:** Edit `lib/scoringEngine.ts` → `DEFAULTS` object (lines ~14–30).
+**Change defaults globally:** Edit `lib/scoringEngine.ts` → `DEFAULTS` object.
 
-**AdminDashboard defaults:** Edit `pages/AdminDashboard.tsx` → `DEFAULT_SCORING_RULES` array (lines ~33–63).
+**AdminDashboard defaults:** Edit `pages/AdminDashboard.tsx` → `DEFAULT_SCORING_RULES` array.
 
 ---
 

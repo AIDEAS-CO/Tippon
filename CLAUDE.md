@@ -26,14 +26,14 @@ npm run dev       # Start dev server (port 3000)
 npm run build     # Production build
 npm run preview   # Preview production build
 npm test          # Unit tests (vitest run; tests/*.test.ts)
-npm run typecheck # tsc --noEmit (2 known errors in lib/supabaseClient.ts: import.meta.env typing)
+npm run typecheck # tsc --noEmit (clean; Vite env types via vite-env.d.ts)
 ```
 
 No linter is configured.
 
 **Env:** `GEMINI_API_KEY` in `.env.local` — used for results-PDF extraction and as the AI fallback for draw PDFs without a text layer (normal draw PDFs are parsed locally).
 
-**DB migrations:** `migrations/009_v2.sql` (run in Supabase SQL editor) is required for v2: global lock + RLS, draft autosave, golden matches, days, Mixed gender.
+**DB migrations:** `migrations/009_v2.sql` (run in Supabase SQL editor) is required for v2: global lock + RLS, draft autosave, golden matches, days, Mixed gender. `migrations/010_categories_admin_rls.sql` adds `is_admin()` write policies (INSERT/UPDATE/DELETE) on `categories`, `tournaments`, `competition_brackets`, `match_results`, `tournament_scores`, `tournament_roster` and admin DELETE on `user_picks` — without them RLS silently skips admin updates/deletes (0 rows). Admin writes in `App.tsx` / `BuildBracket` / `useDraftAutosave` verify affected rows with `.select()` and toast on 0 rows.
 
 ## Architecture Overview
 
@@ -58,7 +58,7 @@ All global state lives in `App.tsx` (no Context or external store). Props are dr
 
 ```typescript
 currentView, tournaments, selectedTournament, userProfile,
-draftTournament, allUserPicks, userStats
+draftTournament, allUserPicks, categoryStatuses, categoryInfos, medalTableStatus
 ```
 
 User picks are also cached to `localStorage` (keyed by `userId + tournamentId`) as a fallback if DB writes fail.
@@ -78,7 +78,7 @@ When editing data fetching or saving, follow this mapping pattern. The function 
 | `App.tsx` | Root: all global state, routing, Supabase calls, `mapTournamentData` |
 | `types.ts` | Source of truth for all TypeScript interfaces (`Tournament`, `Competitor`, `Match`, `UserProfile`, etc.) |
 | `lib/scoringEngine.ts` | Weight-category scoring; `calculateMedalTableScores`; `'_bonuses_'`; `scoring_configuration` |
-| `lib/bracketUtils.ts` | Bracket build, `deriveStandings()`, `sortedUniqueRounds()`, IJF-style field sizing |
+| `lib/bracketUtils.ts` | Bracket build, `resolveBracket()` (UI propagation of picks/results; drops stale downstream picks), `simulateBracket()`, `deriveStandings()`, `sortedUniqueRounds()`, IJF-style field sizing |
 | `lib/countryMedalRanking.ts` | Aggregate G/S/B by country for medal table actuals + scoring |
 | `lib/rosterImportUtils.ts` | Normalize weight labels for Excel/CSV roster import |
 | `pages/BuildBracket.tsx` | Admin bracket builder: import draw PDFs, edit draft, publish to `competition_brackets` |
@@ -92,6 +92,7 @@ When editing data fetching or saving, follow this mapping pattern. The function 
 | `lib/rankings.ts` | `aggregateRanking` (ties share rank), `buildDayRankings` (Total + per-day), `weightsMatch`, `lookupByWeight`, `selectStandingTournament` |
 | `lib/iocCountryFlags.ts` | IOC country code → flag mappings |
 | `migrations/009_v2.sql` | v2 schema + `is_admin()` / `picks_open()` / `picks_visible()` + `user_picks` RLS |
+| `migrations/010_categories_admin_rls.sql` | Admin write RLS policies (`is_admin()`) on all admin-written tables |
 | `tests/` | vitest suites (draft model, draw parser, bracket utils, scoring, rankings) |
 | `CONFIG_PROTOCOL_README.md` | DB schema reference and migration history |
 
@@ -128,6 +129,7 @@ When editing data fetching or saving, follow this mapping pattern. The function 
 - **Golden matches:** admins toggle a match (★) → `handleToggleGolden` updates `tournaments.golden_matches`; R1 ids are `competition_brackets.id`, later rounds `r{level}-m{i}`, always paired with the category.
 - **Layout:** phones (<768px) use `MobileBracketTabs` (round tabs + Extra pick); larger screens a zoomable tree (`BracketZoom`). A sticky bottom bar (progress + Save) sits inside the App scroll container (`app-shell`, `100dvh`).
 - **Byes:** an R1 fight with one athlete (either side) auto-advances (`simulateBracket`, results entry, bracket load).
+- **Propagation:** picks (and admin results in `TournamentResults`) are re-propagated from R1 with `resolveBracket`; changing a winner clears dependent later-round picks. Category label matching uses `weightsMatch` (`lib/rankings.ts`); `normalizeWeightKey` (`lib/bracketDraft.ts`) additionally strips `mixed` and is only used for draw-import matching.
 
 ### Results entry and standings
 
@@ -135,7 +137,7 @@ When editing data fetching or saving, follow this mapping pattern. The function 
 
 ### Scoring
 
-`scoringEngine.ts` compares predicted placements (via `deriveStandings` on user picks) to actual results; persists `tournament_scores` including JSON **`breakdown`** as `ScoringBreakdown` per weight category, plus **`_bonuses_`** rows with `TournamentBonusBreakdown` (`bonusLines`). Gold/silver/bronze deviation is the **rank-step distance** over placements 1→2→3→5→7 (`rankStepDistance`; e.g. predicted 3rd, actual 7th = 2 steps). Golden matches add their points when the pick equals the actual winner (`breakdown.goldenLines`). Additional pick scores 0 if the athlete was also a predicted medalist. Day rankings (`lib/rankings.ts` `buildDayRankings`) group category scores by `categories.day`; Home/Profile show global rank + current tournament Total/Day rank. `Leaderboard.tsx` renders these shapes (tournament view: `Total | Day N` tabs via `buildDayRankings`, Reveal animation, realtime refresh, user modal with Breakdown + Picks tabs); legacy per-round breakdown maps are still supported for old rows. Batch scoring runs from `TournamentResults` via **Finalize & Close** only. See `CONFIG_PROTOCOL_README.md` for scoring keys and migrations.
+`scoringEngine.ts` compares predicted placements (via `deriveStandings` on user picks) to actual results; persists `tournament_scores` including JSON **`breakdown`** as `ScoringBreakdown` per weight category, plus **`_bonuses_`** rows with `TournamentBonusBreakdown` (`bonusLines`). Gold/silver/bronze deviation is the **rank-step distance** over placements 1→2→3→5→7 (`rankStepDistance`; e.g. predicted 3rd, actual 7th = 2 steps). Golden matches add their points when the pick equals the actual winner (`breakdown.goldenLines`). Additional pick scores 0 if the athlete was also a predicted medalist. Day rankings (`lib/rankings.ts` `buildDayRankings`) group category scores by `categories.day`; Home/Profile show global rank + current tournament Total/Day rank. `Leaderboard.tsx` renders these shapes (tournament view: `Total | Day N` tabs via `buildDayRankings`, Reveal animation, realtime refresh, user modal with Breakdown + Picks tabs); legacy per-round breakdown maps are still supported for old rows. Batch scoring runs from `TournamentResults` via **Score & Close** (one category) or **Finalize & Close** (all); players also self-score their own DB-saved picks when opening a COMPLETED bracket (`calculateMyScore`). See `CONFIG_PROTOCOL_README.md` for scoring keys and migrations.
 
 ### Role-Based Access
 

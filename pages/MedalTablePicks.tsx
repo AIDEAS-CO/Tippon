@@ -8,11 +8,7 @@ import {
   MEDAL_TABLE_MEN,
   MEDAL_TABLE_WOMEN,
   MEDAL_TABLE_TOTAL,
-  MEDAL_TABLE_CATEGORY,
 } from '../lib/tournamentConstants';
-
-/** Stored in `user_picks.category` — distinct from weight-class keys. */
-export { MEDAL_TABLE_CATEGORY };
 
 const RANK_SLOTS = 3;
 const RANK_LABELS = ['1st', '2nd', '3rd'];

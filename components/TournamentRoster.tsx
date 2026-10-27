@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { ViewState, Tournament, Competitor } from '../types';
-import { UserPlus, Filter, Search, ChevronLeft, Save, User, Upload, Loader2, X, Plus, Users, Globe, Scale, Trophy, ChevronDown, CheckCircle, GitMerge, Trash2 } from 'lucide-react';
+import { UserPlus, Search, ChevronLeft, Save, User, Upload, Loader2, X, Users, Globe, Scale, Trophy, ChevronDown, CheckCircle, GitMerge, Trash2 } from 'lucide-react';
 import Button from './ui/Button';
 import Flag from './ui/Flag';
 import { supabase } from '../lib/supabaseClient';

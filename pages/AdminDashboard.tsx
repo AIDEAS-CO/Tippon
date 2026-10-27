@@ -247,7 +247,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
 
   const activeId = initialData?.id || createdTournamentId;
 
-  // --- HANDLERS PASO 1 ---
+  // --- STEP 1 HANDLERS ---
   const toggleWeight = (weight: string, isMale: boolean) => {
     if (lockedCategories.includes(weight)) {
         showToast('warning', `${weight} has locked or closed picks and cannot be removed.`);
@@ -285,7 +285,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
               name: formData.name,
               location: formData.location || 'TBD',
               start_date: formData.date,
-              status: initialData?.status || 'upcoming'
+              // DB stores lowercase status; initialData.status is upper-cased by mapTournamentData
+              status: String(initialData?.status || 'upcoming').toLowerCase()
           };
           const payload = { ...basePayload, end_date: formData.endDate || null };
 
@@ -387,14 +388,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       }
   };
 
-  // --- HANDLERS PASO 2 (RULES) ---
-
-  const toggleRule = (id: string) => {
-      setFormData(prev => ({
-          ...prev,
-          scoringRules: prev.scoringRules.map(rule => rule.id === id ? { ...rule, enabled: !rule.enabled } : rule)
-      }));
-  };
+  // --- STEP 2 HANDLERS (RULES) ---
 
   const updateRulePoints = (id: string, points: number) => {
       setFormData(prev => ({
@@ -689,7 +683,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                   const isExpanded = expandedGroups.includes(group.id);
                   const Icon = group.icon;
 
-                  // Filtrar las reglas que pertenecen a este grupo
+                  // Rules that belong to this group
                   const groupRules = formData.scoringRules.filter(r => group.ruleIds.includes(r.id));
 
                   return (

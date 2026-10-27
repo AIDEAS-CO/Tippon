@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo, useEffect } from 'react';
 import { ViewState, Tournament, Competitor, UserRole } from '../types';
-import { ArrowLeft, Search, Filter, Star, Info, Trophy, Loader2 } from 'lucide-react';
+import { ArrowLeft, Search, Star, Info, Trophy, Loader2 } from 'lucide-react';
 import Flag from '../components/ui/Flag';
 import Button from '../components/ui/Button';
 import { supabase } from '../lib/supabaseClient';
@@ -20,7 +20,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
   const [selectedWeight, setSelectedWeight] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // --- CARGA DE DATOS DESDE SUPABASE ---
+  // --- LOAD DATA FROM SUPABASE ---
   useEffect(() => {
     const fetchParticipants = async () => {
       if (!tournament?.id) return;

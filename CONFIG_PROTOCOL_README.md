@@ -36,7 +36,7 @@ All user-facing copy, developer comments in source files, and in-repo technical 
 | Tests       | vitest (`npm test`), `npm run typecheck` (`tsc --noEmit`) |
 | Deployment  | Vercel                                           |
 
-**Commands:** `npm run dev` (port 3000), `npm run build`, `npm run preview`, `npm test` (vitest run, `tests/*.test.ts`), `npm run typecheck` (2 known errors in `lib/supabaseClient.ts`: `import.meta.env` typing).
+**Commands:** `npm run dev` (port 3000), `npm run build`, `npm run preview`, `npm test` (vitest run, `tests/*.test.ts`), `npm run typecheck` (clean; Vite env types come from `vite-env.d.ts`).
 
 ### Key Flows
 
@@ -81,7 +81,7 @@ Includes: `MEDAL_TABLE_PICKS` — opened from the bracket header while the tourn
 - **Final standings**: After the bracket (same scroll area), when the final has a winner and every bronze match (if any) has a winner, shows positions derived via `deriveStandings(matches, results)`.
 - **Country medal summary**: Collapsible table aggregates gold/silver/bronze counts by country across all weight categories (saved `match_results` only).
 - **Global lock**: header buttons **Lock all picks** / **Unlock all picks** (confirm dialog; badge shows state). Lock → `tournaments.picks_locked = true`, `status = 'live'`, `medal_table_status = 'locked'` (only if open/null), every `categories.status = 'open'` → `'locked'` (`handleLockAllPicks` in `App.tsx`). Unlock → `picks_locked = false` only; categories keep their status and must be reopened individually.
-- **Per-category lock** (`handleCategoryLock`): matches `categories.name` by normalized weight (`weightsMatch`), uses `.select()` to verify a row was updated, error toast otherwise. Category dropdown shows lock icons for `locked` (amber) and `closed` (grey).
+- **Per-category lock** (`handleCategoryLock`, also `handleCategoryReopen` / `handleCategoryClose`): matches `categories.name` by normalized weight (`weightsMatch`), uses `.select()` to verify a row was updated, error toast otherwise (needs Migration 010). Category dropdown shows lock icons for `locked` (amber) and `closed` (grey).
 - **Competition days panel** (collapsible): Day 1..N select per category → `categories.day` (`handleSetCategoryDay`). N = max(4, inclusive days from `start_date` to `end_date`).
 - **Golden matches**: admin toggles in `TournamentBracket` call `handleToggleGolden(category, matchId, points|null)` in `App.tsx` → add/replace/remove in `tournaments.golden_matches`. Scoring calls pass `tournament.goldenMatches`.
 - **Pick saves rejected by RLS** (`42501` / "row-level security") → toast "Picks are locked for this category"; `handleSavePicks` resolves `false`.
@@ -442,6 +442,28 @@ ALTER TABLE public.tournament_scores
     FOREIGN KEY (tournament_id) REFERENCES public.tournaments(id) ON DELETE CASCADE;
 ```
 
+### Migration 010 — REQUIRED: admin write policies (categories lock + every admin-written table)
+
+**File:** `migrations/010_categories_admin_rls.sql` — idempotent (`DROP POLICY IF EXISTS` + `CREATE POLICY`), single transaction. Requires `is_admin()` from Migration 009.
+
+**Why:** Supabase/PostgREST returns **no error** when RLS filters rows on `UPDATE` / `DELETE` — the statement just affects 0 rows. `categories` had RLS enabled without admin UPDATE/DELETE policies, so Lock / Reopen / Close category, Lock all picks and the Day editor silently did nothing.
+
+| Table | Policies added (all `TO authenticated`, `is_admin()`) | Admin actions covered |
+|-------|------------------------------------------------------|-----------------------|
+| `categories` | INSERT, UPDATE, DELETE (RLS enabled) | Wizard sync, lock/reopen/close, Lock all, Day editor, delete category |
+| `tournaments` | INSERT, UPDATE, DELETE (replaces Migration 006 policies of the same name, which compared `role = 'ADMIN'`) | Wizard, status, `picks_locked`, `medal_table_status`, `golden_matches`, `bracket_draft` |
+| `competition_brackets` | INSERT, UPDATE, DELETE | Bracket publish (upsert by id / insert / delete), legacy drag & drop |
+| `match_results` | INSERT, UPDATE, DELETE | Results entry + PDF import (upsert), delete category / tournament |
+| `tournament_scores` | INSERT, UPDATE, DELETE | Batch scoring writes rows for **all** users (Migration 005 only allowed own rows) |
+| `tournament_roster` | INSERT, UPDATE, DELETE | Roster import / delete |
+| `user_picks` | DELETE only | Delete category / tournament (INSERT/UPDATE stay owner-only + `picks_open()`) |
+
+RLS is **not** enabled by this migration on any table other than `categories`; on tables with RLS disabled the policies are inert.
+
+**App side:** admin writes verify affected rows with `.select()` and show an error toast on 0 rows: `handleCategoryLock` / `handleCategoryReopen` / `handleCategoryClose` / `handleSetCategoryDay`, medal table lock/reopen, Lock / Unlock all picks, golden matches (`App.tsx`); bracket publish deletes (`BuildBracket.tsx`); draft autosave (`useDraftAutosave`, falls back to "offline" state).
+
+---
+
 ### Migration 009 — REQUIRED for v2 (draft autosave, global lock, golden matches, day ranking, Mixed teams, server-enforced pick lock)
 
 **File:** `migrations/009_v2.sql` — idempotent (safe to re-run), wrapped in a single transaction. Run it in Supabase Dashboard → SQL Editor.
@@ -658,7 +680,7 @@ Tippon/
 ├── lib/
 │   ├── supabaseClient.ts      # Supabase client init
 │   ├── scoringEngine.ts       # Scoring engine: compares picks vs results
-│   ├── bracketUtils.ts        # buildMatchesForBracket, simulateBracket, deriveStandings
+│   ├── bracketUtils.ts        # buildMatchesForBracket, resolveBracket, simulateBracket, deriveStandings
 │   ├── bracketDraft.ts        # Bracket builder draft model (pure)
 │   ├── drawPdfParser.ts       # Local IJF/EJU draw PDF parser (pdfjs text layer)
 │   └── rankings.ts            # Ranking aggregation, day rankings, weightsMatch
@@ -672,7 +694,6 @@ Tippon/
 │   ├── TournamentBracket.tsx  # Bracket viewer + pick system + result colors
 │   ├── TournamentResults.tsx  # Admin: enter real match winners
 │   ├── BuildBracket.tsx       # Admin: draw PDF import (local parser, Gemini fallback) + draft editor + publish
-│   ├── BracketBuilder.tsx     # Admin: manual bracket builder
 │   ├── Leaderboard.tsx        # Global + per-tournament rankings
 │   └── Profile.tsx            # User profile
 ├── components/
@@ -688,6 +709,8 @@ Tippon/
 │       ├── Button.tsx         # Reusable button
 │       └── Flag.tsx           # Flag wrapper
 ├── migrations/009_v2.sql      # v2 schema, picks_open()/picks_visible(), user_picks RLS
+├── migrations/010_categories_admin_rls.sql  # admin write RLS policies (is_admin())
+├── vite-env.d.ts              # Vite client types (import.meta.env)
 ├── tests/                     # vitest suites
 ├── vercel.json                # SPA rewrites for Vercel
 └── .env.local                 # GEMINI_API_KEY + Supabase creds (not committed)
@@ -729,9 +752,10 @@ Tippon/
 
 - `scoring_configuration` from admin is not consumed by `scoringEngine.ts` — engine uses default round-based points (`R1=2, R2=4, QF=8, SF=16, F=32`)
 - Roster re-import can duplicate athletes if no DB unique constraint exists on `(tournament_id, first_name, last_name)`
-- `BuildBracket.tsx` preview mode (`showPreview`) is defined but never triggered (dead code)
 - Medal table picks are 3 slots × 3 keys (`_medal_table_men_`, `_medal_table_women_`, `_medal_table_total_`); legacy `_medal_table_` rows were renamed to `_medal_table_total_` in Migration 008
 - Pick lockout is enforced server-side (RLS + `picks_open()`) only once Migration 009 is applied
+- Admin writes need Migration 010; Migration 005's "Users insert/update own scores" policies still let a player write arbitrary `tournament_scores` for themselves (self-score fallback) — drop them once batch scoring is the only writer
+- `GEMINI_API_KEY` is inlined into the client bundle by `vite.config.ts` (`define`); anyone can read it from the deployed JS — move Gemini calls behind a server/edge function
 
 ## Feature Updates (Major Features)
 
@@ -792,7 +816,7 @@ only the admin's score is stored → only the admin appears in the leaderboard.
 
 2. **Self-calculation fallback** (`TournamentBracket.tsx`):
    - `calculateMyScore(tournamentId, category, userId, myPicks)` — each user computes
-     their own score (reads only their own picks from React state, not DB) and upserts
+     their own score from their **DB-saved** picks (never device-only localStorage picks) and upserts
      the result into `tournament_scores`.
    - A `useEffect` runs for **all categories** (not just the selected tab) the moment
      any authenticated user opens a COMPLETED bracket, ensuring full leaderboard coverage

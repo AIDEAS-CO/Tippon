@@ -60,7 +60,6 @@ const REVEAL_STEP_MS = 400;
 
 interface LeaderboardProps {
   onNavigate: (view: ViewState) => void;
-  userStats: any;
   tournament?: Tournament | null;
 }
 
@@ -80,7 +79,7 @@ interface LeaderboardUser {
   countryCode?: string;
 }
 
-const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavigate }) => {
+const Leaderboard: React.FC<LeaderboardProps> = ({ tournament, onNavigate }) => {
   const [leaderboardData, setLeaderboardData] = useState<LeaderboardUser[]>([]);
   const [currentUserData, setCurrentUserData] = useState<LeaderboardUser | null>(null);
   

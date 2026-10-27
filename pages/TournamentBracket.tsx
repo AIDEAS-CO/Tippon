@@ -7,8 +7,9 @@ import { ArrowLeft, ChevronDown, Loader2, CheckCircle, Trophy, Lock, PanelLeftOp
 import { normalizeWeightCategoryLabel } from '../lib/rosterImportUtils';
 import Flag from '../components/ui/Flag';
 import { supabase } from '../lib/supabaseClient';
-import { calculateMyScore } from '../lib/scoringEngine';
-import { getBracketParticipantCount, buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds, deriveStandings } from '../lib/bracketUtils';
+import { calculateMyScore, getCfg } from '../lib/scoringEngine';
+import { buildMatchesForBracket, sortedUniqueRounds, getPredictedMedalistCompetitorIds, deriveStandings, resolveBracket } from '../lib/bracketUtils';
+import { weightsMatch } from '../lib/rankings';
 import { showToast } from '../lib/toast';
 
 interface BracketProps {
@@ -26,59 +27,12 @@ interface BracketProps {
   onToggleGolden?: (category: string, matchId: string, points: number | null) => void;
 }
 
-/** Normalize category labels so 'Men -60kg', '-60 kg' and '-60' compare equal. */
-const normCategory = (s: string) => normalizeWeightCategoryLabel(s).replace(/kg$/, '');
-const sameCategory = (a: string, b: string) => !!a && !!b && (a === b || normCategory(a) === normCategory(b));
+/** Same weight class despite label differences ('Men -60kg' vs '-60 kg'); empty labels never match. */
+const sameCategory = (a: string, b: string) => !!a && !!b && weightsMatch(a, b);
 
-/** Round processing order for propagation: bronze must come after SF (SF losers feed bronze). */
-const propagationRounds = (list: Match[]): string[] => {
-  const rounds = sortedUniqueRounds(list).filter(r => r !== 'B');
-  if (list.some(m => m.round === 'B')) {
-    const sfIdx = rounds.indexOf('SF');
-    rounds.splice(sfIdx >= 0 ? sfIdx + 1 : rounds.length, 0, 'B');
-  }
-  return rounds;
-};
-
-/**
- * Rebuild later-round slots from R1 + picks, dropping any pick whose competitor
- * is no longer in that match (stale downstream picks after a winner change).
- */
-const resolveBracket = (base: Match[], inputPicks: UserPicks): { matches: Match[]; picks: UserPicks } => {
-  const working = base.map(m => (m.round === 'R1' ? { ...m } : { ...m, competitor1: null, competitor2: null }));
-  const byId = new Map(working.map(m => [m.id, m]));
-  const cleaned: UserPicks = { ...inputPicks };
-
-  propagationRounds(working).forEach(r => {
-    working.filter(m => m.round === r).forEach(m => {
-      const w = cleaned[m.id];
-      if (!w) return;
-      const winner = m.competitor1?.id === w ? m.competitor1 : m.competitor2?.id === w ? m.competitor2 : null;
-      if (!winner) {
-        delete cleaned[m.id];
-        return;
-      }
-      const loser = winner === m.competitor1 ? m.competitor2 : m.competitor1;
-      if (m.nextMatchId) {
-        const t = byId.get(m.nextMatchId);
-        if (t) {
-          if (m.nextMatchSlot === 1) t.competitor1 = winner;
-          else t.competitor2 = winner;
-        }
-      }
-      // Loser goes to repechage / bronze only when both slots are filled
-      if (m.loserNextMatchId && loser && m.competitor1 && m.competitor2) {
-        const t = byId.get(m.loserNextMatchId);
-        if (t) {
-          if (m.loserNextMatchSlot === 1) t.competitor1 = loser;
-          else t.competitor2 = loser;
-        }
-      }
-    });
-  });
-
-  return { matches: working, picks: cleaned };
-};
+/** Same athlete in a `bracket_data` slot: by stable id, else by name + country (legacy rows). */
+const sameAthlete = (entry: any, c: Competitor) =>
+  !!entry && ((!!entry.id && String(entry.id) === c.id) || (entry.name === c.name && entry.country === c.country));
 
 const useMediaQuery = (query: string): boolean => {
   const [matches, setMatches] = useState<boolean>(
@@ -352,13 +306,11 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           // Pool must include every roster athlete in this weight class — not only names
           // still present in bracket_data. After unassign, slots are null in DB; those
           // judokas would otherwise disappear from the sidebar when reloading the category.
-          const normalizeWeight = (s: string) =>
-            s.toLowerCase().replace(/\s+/g, '').replace(/^(men'?s?|women'?s?|male|female)/i, '');
-          const selNorm = normalizeWeight(selectedCategory || '');
+          const selNorm = normalizeWeightCategoryLabel(selectedCategory || '');
           Object.values(rosterMap).forEach((athlete: Competitor) => {
             const w = (athlete as Competitor & { weight?: string }).weight || '';
             if (!w || !selNorm) return;
-            const wNorm = normalizeWeight(w);
+            const wNorm = normalizeWeightCategoryLabel(w);
             const matchesCat =
               wNorm === selNorm || wNorm.includes(selNorm) || selNorm.includes(wNorm);
             if (!matchesCat) return;
@@ -440,8 +392,8 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
 
               // Auto-calculate and persist this user's score (fixes RLS issue where
               // admin-side batch calculation can't read other users' picks).
-              // Each user calculates their own score from their own picks.
-              if (userId && Object.keys(mergedPicks).length > 0) {
+              // Only picks saved in the DB are scored — never device-only (localStorage) picks.
+              if (userId && Object.keys(savedDb).length > 0) {
                 calculateMyScore(tournament.id as string, selectedCategory, userId, mergedPicks)
                   .then(score => setUserScore(score))
                   .catch(() => {
@@ -468,42 +420,12 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
           setUserScore(null);
         }
 
-        // Rehydrate winners — sorted by round order to propagate correctly
-        const sortedRounds = sortedUniqueRounds(freshMatches);
-
-        sortedRounds.forEach(r => {
-          freshMatches.filter(m => m.round === r).forEach(match => {
-            const winnerId = mergedPicks[match.id];
-            if (!winnerId) return;
-
-            const winner = match.competitor1?.id === winnerId
-              ? match.competitor1
-              : (match.competitor2?.id === winnerId ? match.competitor2 : null);
-
-            if (winner && match.nextMatchId) {
-              const target = freshMatches.find(tm => tm.id === match.nextMatchId);
-              if (target) {
-                if (match.nextMatchSlot === 1) target.competitor1 = winner;
-                else target.competitor2 = winner;
-              }
-            }
-
-            // Propagate loser to repechage / bronze
-            if (match.loserNextMatchId && match.competitor1 && match.competitor2) {
-              const loser = match.competitor1.id === winnerId ? match.competitor2 : match.competitor1;
-              const loserTarget = freshMatches.find(tm => tm.id === match.loserNextMatchId);
-              if (loserTarget && loser) {
-                if (match.loserNextMatchSlot === 1) loserTarget.competitor1 = loser;
-                else loserTarget.competitor2 = loser;
-              }
-            }
-
-            if (match.round === 'F' && winnerId) setChampion(winnerId);
-          });
-        });
-
-        setMatches(freshMatches);
-        setPicks(mergedPicks);
+        // Rehydrate winners (drops picks that no longer fit the bracket) and the champion
+        const resolved = resolveBracket(freshMatches, mergedPicks);
+        const finalMatch = resolved.matches.find(m => m.round === 'F');
+        setChampion(finalMatch ? resolved.picks[finalMatch.id] || null : null);
+        setMatches(resolved.matches);
+        setPicks(resolved.picks);
       } catch (err) {
         console.error("Error loading bracket data:", err);
       } finally {
@@ -582,25 +504,33 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       return cloned;
     });
 
-    // Persist removal to Supabase
-    const dbMatch = rawDbMatches.find((m: any) => {
-      const bd = m.bracket_data || {};
-      return (bd.competitor1?.name === competitor.name && bd.competitor1?.country === competitor.country)
-          || (bd.competitor2?.name === competitor.name && bd.competitor2?.country === competitor.country);
+    persistBracketData(withoutCompetitor(competitor));
+  };
+
+  /** bracket_data of every R1 row that holds `competitor`, with that athlete removed. */
+  const withoutCompetitor = (competitor: Competitor): Map<string, any> => {
+    const out = new Map<string, any>();
+    rawDbMatches.forEach((r: any) => {
+      const bd = r.bracket_data || {};
+      const in1 = sameAthlete(bd.competitor1, competitor);
+      const in2 = sameAthlete(bd.competitor2, competitor);
+      if (in1 || in2) {
+        out.set(r.id, { ...bd, competitor1: in1 ? null : bd.competitor1, competitor2: in2 ? null : bd.competitor2 });
+      }
     });
-    if (dbMatch) {
-      const updatedBd = { ...(dbMatch.bracket_data || {}) };
-      if (updatedBd.competitor1?.name === competitor.name && updatedBd.competitor1?.country === competitor.country) {
-        updatedBd.competitor1 = null;
-      }
-      if (updatedBd.competitor2?.name === competitor.name && updatedBd.competitor2?.country === competitor.country) {
-        updatedBd.competitor2 = null;
-      }
+    return out;
+  };
+
+  /** Writes R1 bracket_data changes and keeps rawDbMatches in sync so later edits start from them. */
+  const persistBracketData = (changes: Map<string, any>) => {
+    if (changes.size === 0) return;
+    setRawDbMatches(prev => prev.map((r: any) => (changes.has(r.id) ? { ...r, bracket_data: changes.get(r.id) } : r)));
+    changes.forEach((bd, id) => {
       supabase.from('competition_brackets')
-        .update({ bracket_data: updatedBd })
-        .eq('id', dbMatch.id)
-        .then(({ error }) => { if (error) console.error("Error unassigning competitor:", error); });
-    }
+        .update({ bracket_data: bd })
+        .eq('id', id)
+        .then(({ error }) => { if (error) console.error('Error saving bracket slot:', error); });
+    });
   };
 
   // --- DROP HANDLER ---
@@ -626,16 +556,15 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       return cloned;
     });
 
-    // Persist to Supabase
+    // Persist: clear the athlete's previous slot, then fill the target slot
     const dbMatch = rawDbMatches.find((m: any) => m.id === matchId);
     if (dbMatch) {
-      const updatedBd = { ...(dbMatch.bracket_data || {}) };
+      const changes = withoutCompetitor(competitor);
+      const updatedBd = { ...(changes.get(matchId) ?? dbMatch.bracket_data ?? {}) };
       // Keep the athlete id so picks keyed by it stay valid (same id rule as buildMatchesForBracket)
       updatedBd[slot] = { id: competitor.id, name: competitor.name, country: competitor.country };
-      supabase.from('competition_brackets')
-        .update({ bracket_data: updatedBd })
-        .eq('id', matchId)
-        .then(({ error }) => { if (error) console.error("Error saving drop:", error); });
+      changes.set(matchId, updatedBd);
+      persistBracketData(changes);
     }
   };
 
@@ -692,9 +621,10 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       setPicks(toSave);
     }
 
-    const bracketPickCount = Object.keys(toSave).filter(k => k !== 'additional_pick').length;
-    const completion = matches.length > 0
-      ? Math.round((bracketPickCount / matches.length) * 100)
+    // Same basis as the progress bar: empty R1 fights can never be picked
+    const pickable = matches.filter(m => !(m.round === 'R1' && !m.competitor1 && !m.competitor2));
+    const completion = pickable.length > 0
+      ? Math.round((pickable.filter(m => !!toSave[m.id]).length / pickable.length) * 100)
       : 0;
 
     setPendingSaveData({ picks: toSave, completion });
@@ -833,7 +763,7 @@ const TournamentBracket: React.FC<BracketProps> = ({ onNavigate, returnView, tou
       </select>
       {selectedAP && (
         <p className="mt-2 text-[11px] text-slate-400 text-center">
-          +{2} pts if this athlete reaches the top 7
+          +{getCfg(tournament?.scoring_configuration, 'additional_pick_top7')} pts if this athlete reaches the top 7
         </p>
       )}
     </div>

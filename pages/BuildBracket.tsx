@@ -320,8 +320,10 @@ const BuildBracket: React.FC<BuildBracketProps> = ({ onNavigate, tournament }) =
       }
 
       if (toDelete.length > 0) {
-        const { error } = await supabase.from('competition_brackets').delete().in('id', toDelete);
+        const { data: deleted, error } = await supabase.from('competition_brackets').delete().in('id', toDelete).select('id');
         if (error) throw error;
+        // RLS silently skips rows it does not allow; leftovers would corrupt the published bracket
+        if ((deleted?.length ?? 0) < toDelete.length) throw new Error('Could not delete old bracket rows (check admin permissions)');
       }
       if (toUpsert.length > 0) {
         const { error } = await supabase.from('competition_brackets').upsert(toUpsert, { onConflict: 'id' });

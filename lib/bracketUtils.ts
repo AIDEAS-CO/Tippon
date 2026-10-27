@@ -10,11 +10,6 @@ export function getBracketParticipantCount(athletes: number): number {
   return sizes.find((s) => s >= n) || 128;
 }
 
-/** First-round match count for a bracket that fits `participantCount` athletes. */
-export function expectedR1MatchCountFromParticipants(participantCount: number): number {
-  return getBracketParticipantCount(participantCount) / 2;
-}
-
 /** Round display order (lower = earlier in tournament). */
 export function getRoundOrder(round: string): number {
   if (round === 'F') return 100;
@@ -231,6 +226,62 @@ export function buildMatchesForBracket(
   }
 
   return freshMatches;
+}
+
+// ── Pick / result propagation (UI) ───────────────────────────────────────────
+
+/** Round processing order for propagation: bronze must come after SF (SF losers feed bronze). */
+function propagationRounds(list: Match[]): string[] {
+  const rounds = sortedUniqueRounds(list).filter(r => r !== 'B');
+  if (list.some(m => m.round === 'B')) {
+    const sfIdx = rounds.indexOf('SF');
+    rounds.splice(sfIdx >= 0 ? sfIdx + 1 : rounds.length, 0, 'B');
+  }
+  return rounds;
+}
+
+/**
+ * Rebuild later-round slots from R1 + winner map (user picks or entered results), dropping
+ * any entry whose competitor is no longer in that match (stale downstream picks after a
+ * winner change). Losers go to repechage / bronze only when both slots were filled.
+ * Non-match keys (e.g. `additional_pick`) are kept as-is.
+ */
+export function resolveBracket(
+  base: Match[],
+  inputPicks: Record<string, string>
+): { matches: Match[]; picks: Record<string, string> } {
+  const working = base.map(m => (m.round === 'R1' ? { ...m } : { ...m, competitor1: null, competitor2: null }));
+  const byId = new Map(working.map(m => [m.id, m]));
+  const cleaned: Record<string, string> = { ...inputPicks };
+
+  propagationRounds(working).forEach(r => {
+    working.filter(m => m.round === r).forEach(m => {
+      const w = cleaned[m.id];
+      if (!w) return;
+      const winner = m.competitor1?.id === w ? m.competitor1 : m.competitor2?.id === w ? m.competitor2 : null;
+      if (!winner) {
+        delete cleaned[m.id];
+        return;
+      }
+      const loser = winner === m.competitor1 ? m.competitor2 : m.competitor1;
+      if (m.nextMatchId) {
+        const t = byId.get(m.nextMatchId);
+        if (t) {
+          if (m.nextMatchSlot === 1) t.competitor1 = winner;
+          else t.competitor2 = winner;
+        }
+      }
+      if (m.loserNextMatchId && loser && m.competitor1 && m.competitor2) {
+        const t = byId.get(m.loserNextMatchId);
+        if (t) {
+          if (m.loserNextMatchSlot === 1) t.competitor1 = loser;
+          else t.competitor2 = loser;
+        }
+      }
+    });
+  });
+
+  return { matches: working, picks: cleaned };
 }
 
 // ── Standings Derivation ──────────────────────────────────────────────────────

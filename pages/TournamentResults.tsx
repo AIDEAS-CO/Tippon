@@ -1,27 +1,25 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ViewState, Tournament, Match, Competitor, CategoryStandings } from '../types';
 import { supabase } from '../lib/supabaseClient';
-import { calculateAllCategoryScores, calculateScores, calculateBonusesAndMedalTable } from '../lib/scoringEngine';
+import { calculateAllCategoryScores, calculateScores } from '../lib/scoringEngine';
 import { CategoryStatus, TournamentCategoryInfo } from '../types';
-import { weightsMatch as weightLabelsMatch } from '../lib/rankings';
+import { weightsMatch } from '../lib/rankings';
+import { normalizeWeightCategoryLabel } from '../lib/rosterImportUtils';
 import Flag from '../components/ui/Flag';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   ArrowLeft, ChevronDown, Loader2, Trophy, CheckCircle, Calculator,
   Lock, AlertCircle, Check, FileUp, Upload, X, Trash2, Unlock, CalendarDays,
 } from 'lucide-react';
-import { buildMatchesForBracket, deriveStandings, sortedUniqueRounds } from '../lib/bracketUtils';
+import { buildMatchesForBracket, deriveStandings, sortedUniqueRounds, resolveBracket } from '../lib/bracketUtils';
 import { computeCountryMedalRanking } from '../lib/countryMedalRanking';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/** Normalize a weight string for comparison: strips gender prefix and whitespace. */
-const normalizeWeight = (s: string) =>
-  s.toLowerCase().replace(/\s+/g, '').replace(/^(men'?s?|women'?s?|male|female)/i, '');
-
-const weightsMatch = (dbCat: string, pdfCat: string): boolean => {
-  const a = normalizeWeight(dbCat);
-  const b = normalizeWeight(pdfCat);
+/** Lenient match of a results-PDF weight label to a bracket category (substring after normalization). */
+const pdfWeightMatches = (dbCat: string, pdfCat: string): boolean => {
+  const a = normalizeWeightCategoryLabel(dbCat);
+  const b = normalizeWeightCategoryLabel(pdfCat);
   return a === b || a.includes(b) || b.includes(a);
 };
 
@@ -388,7 +386,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   const statusOf = (cat: string): CategoryStatus | undefined => {
     if (!categoryStatuses) return undefined;
     if (categoryStatuses[cat]) return categoryStatuses[cat];
-    const key = Object.keys(categoryStatuses).find(k => weightLabelsMatch(k, cat));
+    const key = Object.keys(categoryStatuses).find(k => weightsMatch(k, cat));
     return key ? categoryStatuses[key] : undefined;
   };
 
@@ -513,42 +511,9 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
         if (!m.competitor1 && m.competitor2) savedResults[m.id] = m.competitor2.id;
       });
 
-      // Propagate winners and losers
-      const sortedRounds = sortedUniqueRounds(freshMatches);
-
-      sortedRounds.forEach((r) => {
-        freshMatches.filter(m => m.round === r).forEach((match) => {
-          const winnerId = savedResults[match.id];
-          if (!winnerId) return;
-          const winner =
-            match.competitor1?.id === winnerId ? match.competitor1 :
-            match.competitor2?.id === winnerId ? match.competitor2 : null;
-
-          // Winner forward
-          if (winner && match.nextMatchId) {
-            const target = freshMatches.find(tm => tm.id === match.nextMatchId);
-            if (target) {
-              if (match.nextMatchSlot === 1) target.competitor1 = winner;
-              else target.competitor2 = winner;
-            }
-          }
-
-          // Loser to repechage / bronze
-          if (match.loserNextMatchId && match.competitor1 && match.competitor2) {
-            const loser = match.competitor1.id === winnerId ? match.competitor2 : match.competitor1;
-            const loserTarget = freshMatches.find(tm => tm.id === match.loserNextMatchId);
-            if (loserTarget && loser) {
-              if (match.loserNextMatchSlot === 1) loserTarget.competitor1 = loser;
-              else loserTarget.competitor2 = loser;
-            }
-          }
-
-          if (match.round === 'F' && winner) setChampion(winner);
-        });
-      });
-
-      setMatches(freshMatches);
-      setResults(savedResults);
+      // Propagate winners and losers. Keep every saved result in state: results not reachable
+      // yet (e.g. a missing earlier-round result after PDF import) become valid once it is entered.
+      applyResolved({ matches: resolveBracket(freshMatches, savedResults).matches, picks: savedResults });
     } catch (err) {
       console.error('Error loading results data:', err);
     } finally {
@@ -558,43 +523,19 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
 
   // ─── Select winner (manual click) ───────────────────────────────────────
 
+  /** Sets matches/results/champion from a resolved bracket. */
+  const applyResolved = (resolved: { matches: Match[]; picks: Record<string, string> }) => {
+    const final = resolved.matches.find(m => m.round === 'F');
+    const championId = final ? resolved.picks[final.id] : undefined;
+    setChampion(final && championId ? (final.competitor1?.id === championId ? final.competitor1 : final.competitor2) : null);
+    setMatches(resolved.matches);
+    setResults(resolved.picks);
+  };
+
   const handleSelectWinner = (matchId: string, competitorId: string) => {
-    const match = matches.find(m => m.id === matchId);
-    if (!match) return;
-
-    const newResults = { ...results, [matchId]: competitorId };
-    setResults(newResults);
-
-    const winner = match.competitor1?.id === competitorId ? match.competitor1 : match.competitor2;
-    const loser = match.competitor1?.id === competitorId ? match.competitor2 : match.competitor1;
-
-    if (match.nextMatchId || match.loserNextMatchId) {
-      setMatches(prev => {
-        const cloned = prev.map(m => ({ ...m }));
-
-        // Winner forward
-        if (match.nextMatchId && winner) {
-          const target = cloned.find(m => m.id === match.nextMatchId);
-          if (target) {
-            if (match.nextMatchSlot === 1) target.competitor1 = winner;
-            else target.competitor2 = winner;
-          }
-        }
-
-        // Loser to repechage / bronze
-        if (match.loserNextMatchId && loser && match.competitor1 && match.competitor2) {
-          const loserTarget = cloned.find(m => m.id === match.loserNextMatchId);
-          if (loserTarget) {
-            if (match.loserNextMatchSlot === 1) loserTarget.competitor1 = loser;
-            else loserTarget.competitor2 = loser;
-          }
-        }
-
-        return cloned;
-      });
-    }
-
-    if (match.round === 'F') setChampion(winner || null);
+    if (!matches.some(m => m.id === matchId)) return;
+    // Re-propagate from R1 so downstream results that depended on the old winner are cleared
+    applyResolved(resolveBracket(matches, { ...results, [matchId]: competitorId }));
   };
 
   // ─── PDF Extraction — processes ALL categories from the PDF at once ──────
@@ -637,7 +578,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
         if (!pdfCat.matches?.length) continue;
 
         // Find the tournament's category that matches this PDF weight
-        const dbCategory = categories.find(c => weightsMatch(c, pdfCat.weight));
+        const dbCategory = categories.find(c => pdfWeightMatches(c, pdfCat.weight));
         if (!dbCategory) {
           notMatched.push(pdfCat.weight);
           console.log(`[Results Reader] No match for PDF category "${pdfCat.weight}". Tournament categories: ${categories.join(', ')}`);

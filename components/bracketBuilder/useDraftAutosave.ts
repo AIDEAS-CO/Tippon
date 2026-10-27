@@ -82,10 +82,18 @@ export function useDraftAutosave(tournamentId: number | null) {
     }
     dirtyRef.current = false;
     setSaveState({ kind: 'saving' });
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ bracket_draft: current, bracket_draft_updated_at: current.updatedAt })
-      .eq('id', tournamentId);
+      .eq('id', tournamentId)
+      .select('id');
+    if (!error && (!data || data.length === 0)) {
+      // RLS filtered the update (0 rows): keep the device copy and retry later
+      console.error('[BracketDraft] server save updated no row (check admin permissions)');
+      dirtyRef.current = true;
+      setSaveState({ kind: 'offline', at: current.updatedAt });
+      return;
+    }
     if (error) {
       if (isMissingColumn(error)) {
         markDbUnavailable();
@@ -125,9 +133,10 @@ export function useDraftAutosave(tournamentId: number | null) {
     setDraftState(d);
   }, []);
 
+  /** Save pending changes now. A draft that was only loaded (initDraft, not edited) is not persisted. */
   const flush = useCallback(async () => {
+    if (!dirtyRef.current) return;
     if (key && draftRef.current) writeLocal(key, draftRef.current);
-    if (draftRef.current) dirtyRef.current = true;
     await saveToDb();
   }, [key, saveToDb]);
 
@@ -196,5 +205,5 @@ export function useDraftAutosave(tournamentId: number | null) {
     };
   }, [key, saveToDb]);
 
-  return { draft, setDraft, initDraft, loading, saveState, flush, clearDraft, dbAvailable: () => dbAvailableRef.current };
+  return { draft, setDraft, initDraft, loading, saveState, flush, clearDraft };
 }

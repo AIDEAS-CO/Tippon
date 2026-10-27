@@ -7,7 +7,6 @@ import UpdatePassword from './pages/UpdatePassword';
 import Home from './pages/Home';
 import TournamentList from './pages/TournamentList';
 import AdminDashboard from './pages/AdminDashboard';
-import BracketBuilder from './pages/BracketBuilder';
 import TournamentBracket from './pages/TournamentBracket';
 import TournamentRoster from './pages/TournamentRoster';
 import AdminTournamentRoster from './components/TournamentRoster'; 
@@ -55,16 +54,6 @@ const App: React.FC = () => {
 
   // Medal table picks lock status for selected tournament
   const [medalTableStatus, setMedalTableStatus] = useState<'open' | 'locked'>('open');
-
-  // Unified User Stats (Simulating Database for Leaderboard view mock)
-  const [userStats] = useState({
-    rank: 9,
-    points: 2120,
-    accuracy: 78,
-    name: "Sensei John",
-    username: "JudoMaster99",
-    avatar: "https://ui-avatars.com/api/?name=Sensei+John&background=0D8ABC&color=fff"
-  });
 
   // Derived Role helper
   const userRole: UserRole = userProfile?.role === 'ADMIN' ? 'ADMIN' : 'PLAYER';
@@ -394,20 +383,6 @@ const App: React.FC = () => {
     }
   };
 
-  const handleFinalizeTournament = (finalizedTournament: Tournament) => {
-      // Optimistic update of the list
-      setTournaments(prev => {
-          const exists = prev.find(t => t.id === finalizedTournament.id);
-          if (exists) {
-              return prev.map(t => t.id === finalizedTournament.id ? finalizedTournament : t);
-          }
-          return [finalizedTournament, ...prev];
-      });
-      fetchTournaments(); // Ensure sync with DB
-      setDraftTournament(null);
-      setCurrentView('TOURNAMENTS');
-  };
-
   const handleStatusChange = (tournamentId: string, newStatus: string) => {
     setTournaments(prev => prev.map(t =>
       t.id === tournamentId ? { ...t, status: newStatus as any } : t
@@ -494,13 +469,14 @@ const App: React.FC = () => {
   };
 
   const handleCategoryReopen = async (tournamentId: string, categoryName: string) => {
-    const { error } = await supabase
+    const { data: updated, error } = await supabase
       .from('categories')
       .update({ status: 'open' })
-      .in('id', await matchingCategoryIds(tournamentId, categoryName));
-    if (error) {
+      .in('id', await matchingCategoryIds(tournamentId, categoryName))
+      .select('name');
+    if (error || !updated || updated.length === 0) {
       console.error('[handleCategoryReopen] DB error:', error);
-      showToast('error', 'Error reopening category picks.');
+      showToast('error', `Could not reopen "${categoryName}" (no row updated — check admin permissions).`);
       return;
     }
     setCategoryStatuses(prev => ({ ...prev, [categoryName]: 'open' }));
@@ -520,11 +496,12 @@ const App: React.FC = () => {
   };
 
   const handleMedalTableLock = async (tournamentId: string) => {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ medal_table_status: 'locked' })
-      .eq('id', tournamentId);
-    if (error) {
+      .eq('id', tournamentId)
+      .select('id');
+    if (error || !data || data.length === 0) {
       console.error('[handleMedalTableLock] DB error:', error);
       showToast('error', 'Error locking medal table picks.');
       return;
@@ -534,11 +511,12 @@ const App: React.FC = () => {
   };
 
   const handleMedalTableReopen = async (tournamentId: string) => {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ medal_table_status: 'open' })
-      .eq('id', tournamentId);
-    if (error) {
+      .eq('id', tournamentId)
+      .select('id');
+    if (error || !data || data.length === 0) {
       console.error('[handleMedalTableReopen] DB error:', error);
       showToast('error', 'Error reopening medal table picks.');
       return;
@@ -549,11 +527,12 @@ const App: React.FC = () => {
 
   /** Admin: global lock — locks every open category + medal table and marks the tournament LIVE. */
   const handleLockAllPicks = async (tournamentId: string) => {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ picks_locked: true, status: 'live' })
-      .eq('id', tournamentId);
-    if (error) {
+      .eq('id', tournamentId)
+      .select('id');
+    if (error || !data || data.length === 0) {
       console.error('[handleLockAllPicks] DB error:', error);
       showToast('error', 'Error locking all picks.');
       return;
@@ -581,11 +560,12 @@ const App: React.FC = () => {
 
   /** Admin: clears only the global lock; individual categories keep their status. */
   const handleUnlockAllPicks = async (tournamentId: string) => {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ picks_locked: false })
-      .eq('id', tournamentId);
-    if (error) {
+      .eq('id', tournamentId)
+      .select('id');
+    if (error || !data || data.length === 0) {
       console.error('[handleUnlockAllPicks] DB error:', error);
       showToast('error', 'Error unlocking picks.');
       return;
@@ -613,14 +593,16 @@ const App: React.FC = () => {
 
   const handleCategoryClose = async (tournamentId: string, categoryName: string) => {
     // Mark category as closed in DB
-    const { error } = await supabase
+    const { data: updated, error } = await supabase
       .from('categories')
       .update({ status: 'closed' })
-      .in('id', await matchingCategoryIds(tournamentId, categoryName));
+      .in('id', await matchingCategoryIds(tournamentId, categoryName))
+      .select('name');
 
-    if (error) {
+    if (error || !updated || updated.length === 0) {
       console.error('[handleCategoryClose] DB update failed:', error);
-      // If column doesn't exist yet (migration not run), log but don't crash
+      showToast('error', `Could not close "${categoryName}" (no row updated — check admin permissions).`);
+      return;
     }
 
     // Update local state
@@ -736,11 +718,12 @@ const App: React.FC = () => {
     const current: GoldenMatch[] = Array.isArray(t.goldenMatches) ? t.goldenMatches : [];
     const rest = current.filter(g => !(g.matchId === matchId && weightsMatch(g.category, category)));
     const next: GoldenMatch[] = points === null ? rest : [...rest, { category, matchId, points }];
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('tournaments')
       .update({ golden_matches: next })
-      .eq('id', t.id);
-    if (error) {
+      .eq('id', t.id)
+      .select('id');
+    if (error || !data || data.length === 0) {
       console.error('[handleToggleGolden] DB error:', error);
       showToast('error', 'Error updating golden match.');
       return;
@@ -820,6 +803,7 @@ const App: React.FC = () => {
         return <BuildBracket onNavigate={(view) => {
             if (view === 'BRACKET') {
               setSelectedTournament(draftTournament);
+              loadCategoryStatuses(draftTournament.id);
               setReturnView('TOURNAMENTS');
             }
             setCurrentView(view);
@@ -884,9 +868,8 @@ const App: React.FC = () => {
             onSetCategoryDay={handleSetCategoryDay}
         />;
       case 'TOURNAMENT_LEADERBOARD':
-        return <Leaderboard 
-            onNavigate={setCurrentView} 
-            userStats={userStats}
+        return <Leaderboard
+            onNavigate={setCurrentView}
             tournament={selectedTournament}
         />;
       case 'TOURNAMENT_FINAL_RESULTS':
@@ -897,7 +880,7 @@ const App: React.FC = () => {
           />
         );
       case 'LEADERBOARD':
-        return <Leaderboard onNavigate={setCurrentView} userStats={userStats} />;
+        return <Leaderboard onNavigate={setCurrentView} />;
       case 'PROFILE':
         return <Profile 
             onNavigate={setCurrentView} 
