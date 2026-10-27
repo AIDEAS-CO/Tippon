@@ -12,13 +12,30 @@ import { showToast } from '../lib/toast';
 
 interface AdminDashboardProps {
   onNavigate: (view: ViewState) => void;
-  onProceedToRoster: (t: any) => void; 
+  onProceedToRoster: (t: any) => void;
+  /** Next step after scoring rules (bracket builder). Falls back to onProceedToRoster when not provided. */
+  onProceedToBracket?: (t: any) => void;
   initialData?: any;
   initialStep?: 1 | 2;
 }
 
 const MALE_WEIGHTS = ['-60kg', '-66kg', '-73kg', '-81kg', '-90kg', '-100kg', '+100kg'];
 const FEMALE_WEIGHTS = ['-48kg', '-52kg', '-57kg', '-63kg', '-70kg', '-78kg', '+78kg'];
+const TEAMS_CATEGORY = 'Teams';
+
+/** Number of competition days: inclusive span start..end, or 4 when no valid end date. */
+function dayCount(start: string, end: string): number {
+  if (!start || !end) return 4;
+  const a = Date.parse(start);
+  const b = Date.parse(end);
+  if (isNaN(a) || isNaN(b) || b < a) return 4;
+  return Math.min(14, Math.round((b - a) / 86_400_000) + 1);
+}
+
+/** PostgREST / Postgres error for a column that does not exist yet (migration not run). */
+function isMissingColumnError(err: any, column: string): boolean {
+  return !!err && (err.code === '42703' || err.code === 'PGRST204') && String(err.message || '').includes(column);
+}
 
 interface ScoringRule {
   id: string;
@@ -114,7 +131,7 @@ const RULE_GROUPS = [
   }
 ];
 
-const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedToRoster, initialData, initialStep = 1 }) => {
+const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedToRoster, onProceedToBracket, initialData, initialStep = 1 }) => {
   const [step, setStep] = useState<1 | 2>(initialStep);
   const [isNavigating, setIsNavigating] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState<string[]>(['group_1st_2nd']);
@@ -142,7 +159,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
   // Helper to merge saved config with rules
   function mergeScoringConfig(savedConfig: any) {
       return DEFAULT_SCORING_RULES.map(rule => {
-          if (savedConfig[rule.id] !== undefined) {
+          // Disabled rules are saved as 0 so the scoring engine does not fall back to defaults.
+          if (typeof savedConfig[rule.id] === 'number' && savedConfig[rule.id] !== 0) {
               return { ...rule, defaultPoints: savedConfig[rule.id], enabled: true };
           }
           return { ...rule, enabled: false };
@@ -155,6 +173,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
   const [formData, setFormData] = useState<{
       name: string;
       date: string;
+      endDate: string;
       location: string;
       maleSelected: boolean;
       femaleSelected: boolean;
@@ -162,9 +181,13 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       selectedFemaleWeights: string[];
       scoringRules: ScoringRule[];
       hasRepechage: boolean;
+      mixedTeams: boolean;
+      /** Competition day per category name (null = not set). */
+      categoryDays: Record<string, number | null>;
   }>({
       name: initialData?.name || '',
       date: formatDateForInput(initialData?.start_date),
+      endDate: formatDateForInput(initialData?.end_date),
       location: initialData?.location || '',
       // LOGIC: If editing, check if categories exist. If creating, default to TRUE.
       maleSelected: isEditing ? (initialData?.categories?.male?.length > 0) : true,
@@ -176,7 +199,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
           ? mergeScoringConfig(initialData.scoring_configuration)
           : DEFAULT_SCORING_RULES,
       hasRepechage: initialData?.scoring_configuration?.has_repechage ?? false,
+      mixedTeams: (initialData?.categories?.mixed || []).length > 0,
+      categoryDays: {},
   });
+  /** Categories whose picks are locked/closed: cannot be removed from the tournament. */
+  const [lockedCategories, setLockedCategories] = useState<string[]>([]);
 
   // --- PERSISTENCE: Re-sync on initialData change ---
   useEffect(() => {
@@ -185,6 +212,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
             ...prev,
             name: initialData.name || prev.name,
             date: formatDateForInput(initialData.start_date) || prev.date,
+            endDate: formatDateForInput(initialData.end_date) || prev.endDate,
             location: initialData.location || prev.location,
             maleSelected: initialData.categories?.male?.length > 0,
             femaleSelected: initialData.categories?.female?.length > 0,
@@ -194,14 +222,37 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                 ? mergeScoringConfig(initialData.scoring_configuration)
                 : prev.scoringRules,
             hasRepechage: initialData.scoring_configuration?.has_repechage ?? prev.hasRepechage,
+            mixedTeams: (initialData.categories?.mixed || []).length > 0,
         }));
     }
   }, [initialData]);
+
+  // Editing: load competition days and statuses of the saved categories.
+  useEffect(() => {
+    if (!initialData?.id) return;
+    let cancelled = false;
+    (async () => {
+      let res: any = await supabase.from('categories').select('name, status, day').eq('tournament_id', initialData.id);
+      if (isMissingColumnError(res.error, 'day')) {
+        res = await supabase.from('categories').select('name, status').eq('tournament_id', initialData.id);
+      }
+      if (cancelled || res.error || !res.data) return;
+      const days: Record<string, number | null> = {};
+      res.data.forEach((c: any) => { days[c.name] = typeof c.day === 'number' ? c.day : null; });
+      setFormData(prev => ({ ...prev, categoryDays: { ...days, ...prev.categoryDays } }));
+      setLockedCategories(res.data.filter((c: any) => (c.status ?? 'open') !== 'open').map((c: any) => c.name));
+    })();
+    return () => { cancelled = true; };
+  }, [initialData?.id]);
 
   const activeId = initialData?.id || createdTournamentId;
 
   // --- HANDLERS PASO 1 ---
   const toggleWeight = (weight: string, isMale: boolean) => {
+    if (lockedCategories.includes(weight)) {
+        showToast('warning', `${weight} has locked or closed picks and cannot be removed.`);
+        return;
+    }
     if (isMale) {
         setFormData(prev => ({
             ...prev,
@@ -230,41 +281,35 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
           // Re-calculate activeId inside logic to be sure, though state should be source of truth
           let tournamentId = activeId;
           
-          const payload = {
-              name: formData.name, 
-              location: formData.location || 'TBD', 
-              start_date: formData.date, 
-              status: initialData?.status || 'upcoming' 
+          const basePayload = {
+              name: formData.name,
+              location: formData.location || 'TBD',
+              start_date: formData.date,
+              status: initialData?.status || 'upcoming'
           };
+          const payload = { ...basePayload, end_date: formData.endDate || null };
 
           if (tournamentId) {
               // UPDATE: If ID exists, ALWAYS update
-              const { error } = await supabase.from('tournaments').update(payload).eq('id', tournamentId);
+              let { error } = await supabase.from('tournaments').update(payload).eq('id', tournamentId);
+              if (isMissingColumnError(error, 'end_date')) {
+                  ({ error } = await supabase.from('tournaments').update(basePayload).eq('id', tournamentId));
+                  showToast('warning', 'End date not saved: run migration 009.');
+              }
               if (error) throw error;
           } else {
               // INSERT: Only if no ID exists yet
-              const { data, error } = await supabase.from('tournaments').insert([payload]).select().single();
+              let { data, error } = await supabase.from('tournaments').insert([payload]).select().single();
+              if (isMissingColumnError(error, 'end_date')) {
+                  ({ data, error } = await supabase.from('tournaments').insert([basePayload]).select().single());
+                  showToast('warning', 'End date not saved: run migration 009.');
+              }
               if (error) throw error;
               tournamentId = data.id;
               setCreatedTournamentId(tournamentId);
           }
 
-          // Categories Sync - ONLY if not editing (or logic to handle updates safely)
-          // For now, if editing, we skip messing with categories to preserve integrity unless logic changes
-          if (!isEditing) {
-            // Delete existing categories for this tournament to avoid duplicates/stale data
-            const { error: delError } = await supabase.from('categories').delete().eq('tournament_id', tournamentId);
-            if (delError) throw delError;
-
-            const categoriesToInsert = [];
-            if (formData.maleSelected) formData.selectedMaleWeights.forEach((w: string) => categoriesToInsert.push({ tournament_id: tournamentId, name: w, gender: 'Male' }));
-            if (formData.femaleSelected) formData.selectedFemaleWeights.forEach((w: string) => categoriesToInsert.push({ tournament_id: tournamentId, name: w, gender: 'Female' }));
-
-            if (categoriesToInsert.length > 0) {
-                const { error: catError } = await supabase.from('categories').insert(categoriesToInsert);
-                if (catError) throw catError;
-            }
-          }
+          await syncCategories(tournamentId as string | number);
 
           setStep(2);
           window.scrollTo(0,0);
@@ -276,7 +321,65 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
       }
   };
 
-  const handleBack = () => { 
+  /** Desired categories from the form (name, gender, competition day). */
+  const desiredCategories = () => {
+      const out: { name: string; gender: 'Male' | 'Female' | 'Mixed'; day: number | null }[] = [];
+      const day = (name: string) => formData.categoryDays[name] ?? null;
+      if (formData.maleSelected) formData.selectedMaleWeights.forEach(w => out.push({ name: w, gender: 'Male', day: day(w) }));
+      if (formData.femaleSelected) formData.selectedFemaleWeights.forEach(w => out.push({ name: w, gender: 'Female', day: day(w) }));
+      if (formData.mixedTeams) out.push({ name: TEAMS_CATEGORY, gender: 'Mixed', day: day(TEAMS_CATEGORY) });
+      return out;
+  };
+
+  /**
+   * Sync `categories` rows with the form (create and edit): insert new, update gender/day,
+   * delete deselected ones — except categories whose picks are locked/closed.
+   */
+  const syncCategories = async (tournamentId: string | number) => {
+      const desired = desiredCategories();
+      let includeDay = true;
+      let res: any = await supabase.from('categories').select('id, name, gender, status, day').eq('tournament_id', tournamentId);
+      if (isMissingColumnError(res.error, 'day')) {
+          includeDay = false;
+          res = await supabase.from('categories').select('id, name, gender, status').eq('tournament_id', tournamentId);
+      }
+      if (res.error) throw res.error;
+      const existing: any[] = res.data || [];
+
+      const removed = existing.filter(r => !desired.some(d => d.name === r.name));
+      const deletable = removed.filter(r => (r.status ?? 'open') === 'open');
+      const kept = removed.filter(r => (r.status ?? 'open') !== 'open');
+      if (deletable.length > 0) {
+          const { error } = await supabase.from('categories').delete().in('id', deletable.map(r => r.id));
+          if (error) throw error;
+      }
+
+      for (const d of desired) {
+          const ex = existing.find(r => r.name === d.name);
+          if (!ex) continue;
+          const dayChanged = includeDay && (ex.day ?? null) !== d.day;
+          if (ex.gender !== d.gender || dayChanged) {
+              const { error } = await supabase
+                  .from('categories')
+                  .update({ gender: d.gender, ...(includeDay ? { day: d.day } : {}) })
+                  .eq('id', ex.id);
+              if (error) throw error;
+          }
+      }
+
+      const inserts = desired
+          .filter(d => !existing.some(r => r.name === d.name))
+          .map(d => ({ tournament_id: tournamentId, name: d.name, gender: d.gender, ...(includeDay ? { day: d.day } : {}) }));
+      if (inserts.length > 0) {
+          const { error } = await supabase.from('categories').insert(inserts);
+          if (error) throw error;
+      }
+
+      if (!includeDay && desired.some(d => d.day != null)) showToast('warning', 'Competition days not saved: run migration 009.');
+      if (kept.length > 0) showToast('warning', `Kept ${kept.map(r => r.name).join(', ')}: picks are locked or closed.`);
+  };
+
+  const handleBack = () => {
       if (step === 1) {
           onNavigate('HOME');
       } else {
@@ -343,8 +446,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
         const tournamentId = activeId;
         if (!tournamentId) throw new Error("No tournament ID found. Please go back to Step 1.");
 
+        // Disabled rules are saved as 0 (omitted keys would fall back to engine defaults).
         const scoringConfig = formData.scoringRules.reduce((acc, rule) => {
-            if (rule.enabled) acc[rule.id] = rule.defaultPoints;
+            acc[rule.id] = rule.enabled ? rule.defaultPoints : 0;
             return acc;
         }, {} as any);
         scoringConfig.has_repechage = formData.hasRepechage;
@@ -363,13 +467,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
             date: formData.date, 
             location: formData.location, 
             status: initialData?.status || 'upcoming', // Ensure consistency
-            categories: { male: formData.maleSelected ? formData.selectedMaleWeights : [], female: formData.femaleSelected ? formData.selectedFemaleWeights : [] },
+            end_date: formData.endDate || null,
+            categories: {
+                male: formData.maleSelected ? formData.selectedMaleWeights : [],
+                female: formData.femaleSelected ? formData.selectedFemaleWeights : [],
+                ...(formData.mixedTeams ? { mixed: [TEAMS_CATEGORY] } : {}),
+            },
             scoring_configuration: scoringConfig
         };
 
         if (!initialData) localStorage.removeItem('tournamentCreationDraft');
 
-        onProceedToRoster(tournamentForBuilder);
+        (onProceedToBracket ?? onProceedToRoster)(tournamentForBuilder);
 
     } catch (error: any) {
         console.error("Error saving rules:", error);
@@ -395,8 +504,13 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
     // Validate Step 1 State
     const isDateValid = formData.date >= today && formData.date <= nextYear;
     const isNameValid = formData.name.trim().length > 0;
-    const isCategoryValid = formData.maleSelected || formData.femaleSelected;
-    const canProceed = isNameValid && isDateValid && isCategoryValid;
+    const isCategoryValid = formData.maleSelected || formData.femaleSelected || formData.mixedTeams;
+    const isEndDateValid = !formData.endDate || !formData.date || formData.endDate >= formData.date;
+    const canProceed = isNameValid && isDateValid && isEndDateValid && isCategoryValid;
+    const days = dayCount(formData.date, formData.endDate);
+    const dayCategories = desiredCategories();
+    const setDay = (name: string, value: string) =>
+        setFormData(prev => ({ ...prev, categoryDays: { ...prev.categoryDays, [name]: value ? Number(value) : null } }));
 
     return (
     <div className="animate-in fade-in slide-in-from-right duration-300 w-full max-w-4xl mx-auto">
@@ -432,6 +546,21 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                         <p className="text-xs text-red-500 font-bold mt-1">Date must be between {today} and {nextYear}</p>
                     )}
                  </div>
+                 <div className="flex flex-col gap-2">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">End Date <span className="text-slate-400 normal-case font-medium">(optional)</span></label>
+                    <input
+                        type="date"
+                        value={formData.endDate}
+                        onChange={(e) => setFormData({...formData, endDate: e.target.value})}
+                        className={`w-full h-11 px-4 rounded-lg border bg-slate-50 focus:bg-white focus:ring-2 focus:ring-blue-600 outline-none font-medium cursor-pointer ${
+                            !isEndDateValid ? 'border-red-300 focus:ring-red-200' : 'border-slate-200'
+                        }`}
+                        min={formData.date || today}
+                    />
+                    {!isEndDateValid && (
+                        <p className="text-xs text-red-500 font-bold mt-1">End date must be on or after the start date</p>
+                    )}
+                 </div>
             </div>
 
             <div className="w-full h-px bg-slate-100 mb-8"></div>
@@ -440,35 +569,41 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                  <div className="flex justify-between items-center mb-1">
                     <label className="text-sm font-bold text-slate-900 flex items-center gap-2"><Tag size={16} className="text-blue-600" /> Weight Categories</label>
                     
-                    {isEditing ? (
-                        <div className="flex items-center gap-1.5 px-2 py-1 bg-slate-100 text-slate-500 rounded border border-slate-200">
-                            <Lock size={12} />
-                            <span className="text-[10px] font-bold uppercase tracking-wide">Locked during edit</span>
-                        </div>
-                    ) : (
-                        <div className="flex gap-4">
-                            <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600"><input type="checkbox" checked={formData.maleSelected} onChange={(e) => setFormData({...formData, maleSelected: e.target.checked})} className="rounded text-blue-600" /> Male</label>
-                            <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600"><input type="checkbox" checked={formData.femaleSelected} onChange={(e) => setFormData({...formData, femaleSelected: e.target.checked})} className="rounded text-blue-600" /> Female</label>
-                        </div>
-                    )}
+                    <div className="flex flex-wrap gap-4">
+                        <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600"><input type="checkbox" checked={formData.maleSelected} onChange={(e) => setFormData({...formData, maleSelected: e.target.checked})} className="rounded text-blue-600" /> Male</label>
+                        <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600"><input type="checkbox" checked={formData.femaleSelected} onChange={(e) => setFormData({...formData, femaleSelected: e.target.checked})} className="rounded text-blue-600" /> Female</label>
+                        <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-600">
+                            <input
+                                type="checkbox"
+                                checked={formData.mixedTeams}
+                                onChange={(e) => {
+                                    if (!e.target.checked && lockedCategories.includes(TEAMS_CATEGORY)) {
+                                        showToast('warning', `${TEAMS_CATEGORY} has locked or closed picks and cannot be removed.`);
+                                        return;
+                                    }
+                                    setFormData({...formData, mixedTeams: e.target.checked});
+                                }}
+                                className="rounded text-purple-600"
+                            /> Mixed Teams
+                        </label>
+                    </div>
                  </div>
 
                  {/* Male Weights */}
                  <div className={`space-y-3 transition-opacity duration-200 ${formData.maleSelected ? 'opacity-100' : 'opacity-30 pointer-events-none'}`}>
                     <div className="flex flex-wrap gap-2">
                         {MALE_WEIGHTS.map(w => (
-                            <button 
-                                key={w} 
-                                onClick={() => !isEditing && toggleWeight(w, true)}
-                                disabled={isEditing}
-                                className={`px-2.5 py-1.5 rounded-md text-xs font-bold border transition-all ${
-                                    formData.selectedMaleWeights.includes(w) 
-                                        ? 'bg-blue-600 text-white border-blue-600' 
-                                        : isEditing 
-                                            ? 'bg-slate-50 text-slate-300 border-slate-100' 
-                                            : 'bg-white'
+                            <button
+                                key={w}
+                                onClick={() => toggleWeight(w, true)}
+                                title={lockedCategories.includes(w) ? 'Picks locked or closed' : undefined}
+                                className={`px-2.5 py-1.5 rounded-md text-xs font-bold border transition-all inline-flex items-center gap-1 ${
+                                    formData.selectedMaleWeights.includes(w)
+                                        ? 'bg-blue-600 text-white border-blue-600'
+                                        : 'bg-white'
                                 }`}
                             >
+                                {lockedCategories.includes(w) && <Lock size={10} />}
                                 {w}
                             </button>
                         ))}
@@ -479,23 +614,49 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                  <div className={`space-y-3 transition-opacity duration-200 ${formData.femaleSelected ? 'opacity-100' : 'opacity-30 pointer-events-none'}`}>
                     <div className="flex flex-wrap gap-2">
                         {FEMALE_WEIGHTS.map(w => (
-                            <button 
-                                key={w} 
-                                onClick={() => !isEditing && toggleWeight(w, false)}
-                                disabled={isEditing}
-                                className={`px-2.5 py-1.5 rounded-md text-xs font-bold border transition-all ${
-                                    formData.selectedFemaleWeights.includes(w) 
-                                        ? 'bg-pink-600 text-white border-pink-600' 
-                                        : isEditing 
-                                            ? 'bg-slate-50 text-slate-300 border-slate-100' 
-                                            : 'bg-white'
+                            <button
+                                key={w}
+                                onClick={() => toggleWeight(w, false)}
+                                title={lockedCategories.includes(w) ? 'Picks locked or closed' : undefined}
+                                className={`px-2.5 py-1.5 rounded-md text-xs font-bold border transition-all inline-flex items-center gap-1 ${
+                                    formData.selectedFemaleWeights.includes(w)
+                                        ? 'bg-pink-600 text-white border-pink-600'
+                                        : 'bg-white'
                                 }`}
                             >
+                                {lockedCategories.includes(w) && <Lock size={10} />}
                                 {w}
                             </button>
                         ))}
                     </div>
                  </div>
+
+                 {/* Competition day per category */}
+                 {dayCategories.length > 0 && (
+                    <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                            <label className="text-sm font-bold text-slate-900">Competition Day</label>
+                            <span className="text-xs text-slate-400">{days} day{days === 1 ? '' : 's'}{formData.endDate ? '' : ' (set an end date to change)'}</span>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                            {dayCategories.map(c => (
+                                <label key={c.name} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-slate-100 bg-slate-50 text-sm">
+                                    <span className={`font-semibold truncate ${c.gender === 'Male' ? 'text-blue-700' : c.gender === 'Female' ? 'text-pink-700' : 'text-purple-700'}`}>{c.name}</span>
+                                    <select
+                                        value={c.day ?? ''}
+                                        onChange={(e) => setDay(c.name, e.target.value)}
+                                        className="border border-slate-200 rounded-md px-1.5 py-1 text-sm bg-white"
+                                    >
+                                        <option value="">—</option>
+                                        {Array.from({ length: days }, (_, i) => i + 1).map(d => (
+                                            <option key={d} value={d}>Day {d}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                            ))}
+                        </div>
+                    </div>
+                 )}
             </div>
         </div>
         <div className="mt-6 flex justify-end">
@@ -627,7 +788,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate, onProceedTo
                 className="min-w-[200px]"
                 disabled={isNavigating}
               >
-                {isNavigating ? 'Saving...' : 'Save & Manage Roster'}
+                {isNavigating ? 'Saving...' : (onProceedToBracket ? 'Save & Build Brackets' : 'Save & Manage Roster')}
               </Button>
           </div>
       </div>

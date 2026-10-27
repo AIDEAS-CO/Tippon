@@ -43,6 +43,27 @@ export interface UserProfile {
 export interface TournamentCategories {
   male: string[];
   female: string[];
+  /** Mixed / Teams categories — count only toward the Total medal table. */
+  mixed?: string[];
+}
+
+/** `categories.gender` values. Mixed (e.g. Mixed Teams) never counts toward Men/Women medal tables. */
+export type CategoryGender = 'Male' | 'Female' | 'Mixed';
+
+/** One `categories` row as needed by the UI (status, competition day). */
+export interface TournamentCategoryInfo {
+  name: string;
+  gender?: CategoryGender;
+  status?: CategoryStatus;
+  /** Competition day (1-based). Used for per-day leaderboards. */
+  day?: number;
+}
+
+/** Admin-flagged match worth extra points if the user picks its actual winner. */
+export interface GoldenMatch {
+  category: string;
+  matchId: string;
+  points: number;
 }
 
 export type TournamentStatus = 'DRAFT' | 'LIVE' | 'UPCOMING' | 'COMPLETED' | 'SORTING';
@@ -62,6 +83,9 @@ export interface Tournament {
   brackets?: Record<string, Record<string, Competitor | null>>;
   // Configuration options (optional)
   scoring_configuration?: any; 
+  /** From DB column `tournaments.golden_matches` (jsonb). */
+  goldenMatches?: GoldenMatch[];
+  picksLocked?: boolean;
 }
 
 export interface UserPicks {
@@ -82,6 +106,7 @@ export interface PositionScoreDetail {
   competitorName?: string;
   predicted: number;
   actual: number | null; // null if athlete didn't reach QF at all
+  /** Rank-step distance over positions 1,2,3,5,7 (e.g. 3rd→5th = 1); 99 if no actual placement. */
   deviation: number;
   points: number;
 }
@@ -92,7 +117,21 @@ export interface ScoringBreakdown {
   bronze: PositionScoreDetail[];
   poolFinals: { correct: number; total: number; points: number };
   additionalPick: { competitorId: string | null; actualPosition: number | null; points: number };
+  /** Golden match lines (included in categoryTotal). Absent on legacy rows. */
+  goldenLines?: GoldenMatchScoreLine[];
   categoryTotal: number;
+}
+
+/** Score line for one golden match. */
+export interface GoldenMatchScoreLine {
+  matchId: string;
+  round?: string;
+  label?: string;
+  pickedId: string | null;
+  pickedName?: string;
+  winnerId: string | null;
+  winnerName?: string;
+  points: number;
 }
 
 /** One tournament-wide bonus rule line (stored on `tournament_scores` row `category = '_bonuses_'`). */

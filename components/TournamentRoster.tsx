@@ -535,7 +535,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                             className="bg-purple-600 hover:bg-purple-700 text-white"
                             icon={GitMerge}
                         >
-                            Generate Brackets (Upload PDF)
+                            Generate Brackets (Upload Draw PDF)
                         </Button>
                     </div>
                 )}
@@ -619,7 +619,7 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                             disabled={isProcessing}
                             className={isProcessing ? "opacity-70 cursor-wait" : ""}
                         >
-                            {isProcessing ? 'Importing...' : 'Bulk Upload'}
+                            {isProcessing ? 'Importing...' : 'Optional: import world ranking (Excel)'}
                         </Button>
                         
                         <Button 
@@ -646,10 +646,10 @@ const TournamentRoster: React.FC<TournamentRosterProps> = ({ onNavigate, tournam
                         </div>
                         <h2 className="text-2xl font-bold text-slate-900 mb-2">Ready to build your roster?</h2>
                         <p className="text-slate-500 max-w-md mb-8 leading-relaxed">
-                            Upload your judokas from a CSV/Excel file or add them manually to get started with the tournament configuration.
+                            Athletes are created from the draw when you build brackets. Optionally import a world ranking from Excel/CSV, or add athletes manually.
                         </p>
                         <div className="flex flex-col sm:flex-row gap-4 w-full sm:w-auto">
-                             <Button onClick={triggerFileUpload} icon={Upload} size="lg" fullWidth={false} className="min-w-[180px]">Upload Roster</Button>
+                             <Button onClick={triggerFileUpload} icon={Upload} size="lg" fullWidth={false} className="min-w-[180px]">Optional: import world ranking (Excel)</Button>
                              <Button onClick={() => setIsAddModalOpen(true)} variant="secondary" icon={UserPlus} size="lg" fullWidth={false} className="min-w-[180px]">Add Manually</Button>
                         </div>
                     </div>

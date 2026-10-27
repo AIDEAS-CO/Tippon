@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { ViewState, UserProfile } from '../types';
+import { ViewState, UserProfile, Tournament } from '../types';
 import { 
   User, Settings, LogOut, 
   ChevronLeft, Mail, Camera, CheckCircle, Loader2, AtSign, ChevronRight, Save
@@ -8,16 +8,51 @@ import {
 import { supabase } from '../lib/supabaseClient';
 import Button from '../components/ui/Button';
 import { showToast } from '../lib/toast';
+import { buildDayRankings, rankOf, selectStandingTournament } from '../lib/rankings';
 
 interface ProfileProps {
   onNavigate: (view: ViewState) => void;
   userProfile: UserProfile | null;
   refreshProfile: () => Promise<void>;
+  /** Global tournament list (used to pick the current/most recent tournament for the standing card). */
+  tournaments?: Tournament[];
 }
 
 type SubView = 'MAIN' | 'ACCOUNT';
 
-const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfile }) => {
+const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfile, tournaments = [] }) => {
+  // Standing in the current / most recent LIVE or COMPLETED tournament the user played
+  const [standing, setStanding] = useState<{
+    name: string;
+    total: { rank: number; of: number } | null;
+    day: number | null;
+    dayRank: { rank: number; of: number } | null;
+  } | null>(null);
+
+  useEffect(() => {
+    const uid = userProfile?.id;
+    if (!uid) return;
+    (async () => {
+      const { data: mine } = await supabase
+        .from('tournament_scores')
+        .select('tournament_id')
+        .eq('user_id', uid);
+      const t = selectStandingTournament(tournaments, new Set((mine || []).map((r: any) => String(r.tournament_id))));
+      if (!t) { setStanding(null); return; }
+      const [{ data: rows }, { data: cats }] = await Promise.all([
+        supabase.from('tournament_scores').select('user_id, category, total_points').eq('tournament_id', t.id),
+        supabase.from('categories').select('name, day').eq('tournament_id', t.id),
+      ]);
+      const dr = buildDayRankings(rows || [], cats || []);
+      setStanding({
+        name: t.name,
+        total: rankOf(dr.total, uid),
+        day: dr.latestDay,
+        dayRank: dr.latestDay !== null ? rankOf(dr.byDay[dr.latestDay], uid) : null,
+      });
+    })();
+  }, [userProfile?.id, tournaments]);
+
   const [currentSubView, setCurrentSubView] = useState<SubView>('MAIN');
   const [showLogoutModal, setShowLogoutModal] = useState(false);
   
@@ -278,6 +313,31 @@ const Profile: React.FC<ProfileProps> = ({ onNavigate, userProfile, refreshProfi
             </span>
          </div>
       </div>
+
+      {/* Tournament standing */}
+      {standing && (
+        <div className="bg-white rounded-2xl shadow-zen p-5 mb-6 border border-slate-100 flex flex-wrap items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Tournament standing</p>
+            <h3 className="text-base font-black text-slate-900 truncate">{standing.name}</h3>
+          </div>
+          <div className="flex gap-6">
+            <div>
+              <p className="text-[10px] font-bold text-slate-400 uppercase">Total</p>
+              <p className="text-xl font-black text-slate-900">
+                {standing.total ? `#${standing.total.rank}` : '-'}
+                {standing.total && <span className="text-xs font-bold text-slate-400"> of {standing.total.of}</span>}
+              </p>
+            </div>
+            {standing.day !== null && (
+              <div>
+                <p className="text-[10px] font-bold text-slate-400 uppercase">Day {standing.day}</p>
+                <p className="text-xl font-black text-primary">{standing.dayRank ? `#${standing.dayRank.rank}` : '-'}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Settings Options */}
       <div className="bg-white rounded-xl shadow-zen border border-slate-100 overflow-hidden opacity-0 animate-fade-in-up stagger-2">

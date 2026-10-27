@@ -19,10 +19,11 @@ import Leaderboard from './pages/Leaderboard';
 import Profile from './pages/Profile';
 import Navigation from './components/Navigation';
 import Toast from './components/ui/Toast';
-import { ViewState, UserRole, Tournament, UserPicks, Competitor, UserProfile, CategoryStatus } from './types';
+import { ViewState, UserRole, Tournament, UserPicks, Competitor, UserProfile, CategoryStatus, TournamentCategoryInfo, GoldenMatch } from './types';
 import { supabase } from './lib/supabaseClient';
 import { calculateBonusesAndMedalTable } from './lib/scoringEngine';
 import { showToast } from './lib/toast';
+import { weightsMatch } from './lib/rankings';
 
 const App: React.FC = () => {
   const [currentView, setCurrentView] = useState<ViewState>('LOGIN');
@@ -48,6 +49,9 @@ const App: React.FC = () => {
 
   // Per-category open/locked/closed status: Record<categoryName, CategoryStatus>
   const [categoryStatuses, setCategoryStatuses] = useState<Record<string, CategoryStatus>>({});
+
+  // Category rows (name, status, day, gender) for the selected tournament
+  const [categoryInfos, setCategoryInfos] = useState<TournamentCategoryInfo[]>([]);
 
   // Medal table picks lock status for selected tournament
   const [medalTableStatus, setMedalTableStatus] = useState<'open' | 'locked'>('open');
@@ -182,11 +186,13 @@ const App: React.FC = () => {
       }
 
       // Map Categories correctly into { male: [], female: [] }
-      let categoriesObj = { male: [], female: [] };
+      let categoriesObj: { male: string[]; female: string[]; mixed?: string[] } = { male: [], female: [] };
       if (Array.isArray(data.categories)) {
           // If fetched from categories table relation
           categoriesObj.male = data.categories.filter((c: any) => c.gender === 'Male').map((c: any) => c.name);
           categoriesObj.female = data.categories.filter((c: any) => c.gender === 'Female').map((c: any) => c.name);
+          const mixed = data.categories.filter((c: any) => c.gender === 'Mixed').map((c: any) => c.name);
+          if (mixed.length > 0) categoriesObj.mixed = mixed;
       } else if (data.categories && (data.categories.male || data.categories.female)) {
           // Fallback if data structure is already correct
           categoriesObj = data.categories;
@@ -199,7 +205,9 @@ const App: React.FC = () => {
           status: data.status ? data.status.toUpperCase() : 'UPCOMING',
           roster: finalRoster,
           participantCount: finalRoster.length,
-          categories: categoriesObj
+          categories: categoriesObj,
+          goldenMatches: Array.isArray(data.golden_matches) ? data.golden_matches : [],
+          picksLocked: !!data.picks_locked
       };
   };
 
@@ -246,7 +254,7 @@ const App: React.FC = () => {
 
   // Fetch on mount and when navigating to main views
   useEffect(() => {
-      if (currentView === 'TOURNAMENTS' || currentView === 'HOME') {
+      if (currentView === 'TOURNAMENTS' || currentView === 'HOME' || currentView === 'PROFILE') {
           fetchTournaments();
       }
   }, [currentView]);
@@ -412,7 +420,7 @@ const App: React.FC = () => {
   const loadCategoryStatuses = async (tournamentId: string) => {
     const { data, error } = await supabase
       .from('categories')
-      .select('name, status')
+      .select('name, status, day, gender')
       .eq('tournament_id', tournamentId);
     if (error || !data) return;
     const map: Record<string, CategoryStatus> = {};
@@ -420,6 +428,12 @@ const App: React.FC = () => {
       map[row.name] = (row.status as CategoryStatus) || 'open';
     }
     setCategoryStatuses(map);
+    setCategoryInfos(data.map((row: any) => ({
+      name: row.name,
+      gender: row.gender || undefined,
+      status: (row.status as CategoryStatus) || 'open',
+      day: typeof row.day === 'number' ? row.day : undefined,
+    })));
 
     // Load medal table status
     const { data: tData } = await supabase
@@ -431,17 +445,41 @@ const App: React.FC = () => {
   };
 
   const handleCategoryLock = async (tournamentId: string, categoryName: string) => {
-    const { error } = await supabase
+    // Match by normalized weight: bracket labels and categories.name may differ ("Men -60kg" vs "-60kg")
+    const { data: cats, error: catsErr } = await supabase
+      .from('categories')
+      .select('id, name')
+      .eq('tournament_id', tournamentId);
+    if (catsErr) {
+      console.error('[handleCategoryLock] DB error:', catsErr);
+      showToast('error', 'Error locking category picks.');
+      return;
+    }
+    const matchIds = (cats || []).filter((c: any) => weightsMatch(c.name, categoryName)).map((c: any) => c.id);
+    if (matchIds.length === 0) {
+      showToast('error', `No category matching "${categoryName}" found. Picks were NOT locked.`);
+      return;
+    }
+    const { data: updated, error } = await supabase
       .from('categories')
       .update({ status: 'locked' })
-      .eq('tournament_id', tournamentId)
-      .eq('name', categoryName);
+      .in('id', matchIds)
+      .select('name');
     if (error) {
       console.error('[handleCategoryLock] DB error:', error);
       showToast('error', 'Error locking category picks.');
       return;
     }
-    setCategoryStatuses(prev => ({ ...prev, [categoryName]: 'locked' }));
+    if (!updated || updated.length === 0) {
+      showToast('error', `Lock for "${categoryName}" did not update any row (check admin permissions).`);
+      return;
+    }
+    setCategoryStatuses(prev => {
+      const next = { ...prev, [categoryName]: 'locked' as CategoryStatus };
+      for (const row of updated) next[row.name] = 'locked';
+      return next;
+    });
+    setCategoryInfos(prev => prev.map(c => updated.some((u: any) => u.name === c.name) ? { ...c, status: 'locked' } : c));
     // If any category is now locked/closed, tournament should be LIVE
     handleStatusChange(tournamentId, 'LIVE');
     await supabase.from('tournaments').update({ status: 'live' }).eq('id', tournamentId);
@@ -449,12 +487,17 @@ const App: React.FC = () => {
     showToast('success', `Picks locked for "${categoryName}".`);
   };
 
+  /** Ids of category rows whose name matches a (possibly legacy) bracket label by normalized weight. */
+  const matchingCategoryIds = async (tournamentId: string, categoryName: string): Promise<string[]> => {
+    const { data } = await supabase.from('categories').select('id, name').eq('tournament_id', tournamentId);
+    return (data || []).filter((c: any) => weightsMatch(c.name, categoryName)).map((c: any) => c.id);
+  };
+
   const handleCategoryReopen = async (tournamentId: string, categoryName: string) => {
     const { error } = await supabase
       .from('categories')
       .update({ status: 'open' })
-      .eq('tournament_id', tournamentId)
-      .eq('name', categoryName);
+      .in('id', await matchingCategoryIds(tournamentId, categoryName));
     if (error) {
       console.error('[handleCategoryReopen] DB error:', error);
       showToast('error', 'Error reopening category picks.');
@@ -467,7 +510,7 @@ const App: React.FC = () => {
       .from('categories')
       .select('name, status')
       .eq('tournament_id', tournamentId);
-    const allOpen = (allCats || []).every(c => c.name === categoryName || c.status === 'open');
+    const allOpen = (allCats || []).every(c => weightsMatch(c.name, categoryName) || c.status === 'open');
     if (allOpen) {
       await supabase.from('tournaments').update({ status: 'upcoming' }).eq('id', tournamentId);
       handleStatusChange(tournamentId, 'UPCOMING');
@@ -504,13 +547,76 @@ const App: React.FC = () => {
     showToast('success', 'Medal table picks reopened.');
   };
 
+  /** Admin: global lock — locks every open category + medal table and marks the tournament LIVE. */
+  const handleLockAllPicks = async (tournamentId: string) => {
+    const { error } = await supabase
+      .from('tournaments')
+      .update({ picks_locked: true, status: 'live' })
+      .eq('id', tournamentId);
+    if (error) {
+      console.error('[handleLockAllPicks] DB error:', error);
+      showToast('error', 'Error locking all picks.');
+      return;
+    }
+    // medal_table_status: only when currently open/null
+    await supabase
+      .from('tournaments')
+      .update({ medal_table_status: 'locked' })
+      .eq('id', tournamentId)
+      .or('medal_table_status.is.null,medal_table_status.eq.open');
+    const { error: catErr } = await supabase
+      .from('categories')
+      .update({ status: 'locked' })
+      .eq('tournament_id', tournamentId)
+      .eq('status', 'open');
+    if (catErr) console.error('[handleLockAllPicks] categories update error:', catErr);
+
+    setSelectedTournament(prev => prev && prev.id === tournamentId ? { ...prev, picksLocked: true } : prev);
+    setTournaments(prev => prev.map(t => t.id === tournamentId ? { ...t, picksLocked: true } : t));
+    handleStatusChange(tournamentId, 'LIVE');
+    await loadCategoryStatuses(tournamentId);
+    fetchTournaments();
+    showToast('success', 'All picks locked.');
+  };
+
+  /** Admin: clears only the global lock; individual categories keep their status. */
+  const handleUnlockAllPicks = async (tournamentId: string) => {
+    const { error } = await supabase
+      .from('tournaments')
+      .update({ picks_locked: false })
+      .eq('id', tournamentId);
+    if (error) {
+      console.error('[handleUnlockAllPicks] DB error:', error);
+      showToast('error', 'Error unlocking picks.');
+      return;
+    }
+    setSelectedTournament(prev => prev && prev.id === tournamentId ? { ...prev, picksLocked: false } : prev);
+    setTournaments(prev => prev.map(t => t.id === tournamentId ? { ...t, picksLocked: false } : t));
+    showToast('success', 'Global lock removed. Reopen individual categories to allow picks again.');
+  };
+
+  /** Admin: set the competition day of a category (null clears it). */
+  const handleSetCategoryDay = async (tournamentId: string, categoryName: string, day: number | null) => {
+    const { data, error } = await supabase
+      .from('categories')
+      .update({ day })
+      .eq('tournament_id', tournamentId)
+      .eq('name', categoryName)
+      .select('name');
+    if (error || !data || data.length === 0) {
+      console.error('[handleSetCategoryDay] DB error:', error);
+      showToast('error', `Could not set day for "${categoryName}".`);
+      return;
+    }
+    setCategoryInfos(prev => prev.map(c => c.name === categoryName ? { ...c, day: day ?? undefined } : c));
+  };
+
   const handleCategoryClose = async (tournamentId: string, categoryName: string) => {
     // Mark category as closed in DB
     const { error } = await supabase
       .from('categories')
       .update({ status: 'closed' })
-      .eq('tournament_id', tournamentId)
-      .eq('name', categoryName);
+      .in('id', await matchingCategoryIds(tournamentId, categoryName));
 
     if (error) {
       console.error('[handleCategoryClose] DB update failed:', error);
@@ -526,7 +632,7 @@ const App: React.FC = () => {
       .select('name, status')
       .eq('tournament_id', tournamentId);
 
-    const allClosed = (allCats || []).every(c => (c.status === 'closed') || c.name === categoryName);
+    const allClosed = (allCats || []).every(c => (c.status === 'closed') || weightsMatch(c.name, categoryName));
 
     if (allClosed && allCats && allCats.length > 0) {
       // All categories closed → run medal table + bonuses, then mark tournament COMPLETED
@@ -571,7 +677,35 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSavePicks = async (tournamentId: string, category: string, picks: UserPicks, completion: number) => {
+  /** Returns false when the DB rejected the save (e.g. picks locked by RLS). */
+  const handleSavePicks = async (tournamentId: string, category: string, picks: UserPicks, completion: number): Promise<boolean> => {
+      // DB first so a server-side lock rejection doesn't leave the picks cached locally
+      if (userProfile?.id) {
+          try {
+              const { error } = await supabase
+                  .from('user_picks')
+                  .upsert({
+                      user_id: userProfile.id,
+                      tournament_id: tournamentId,
+                      category: category,
+                      picks_data: picks,
+                      completion_percentage: completion,
+                      updated_at: new Date().toISOString()
+                  }, { onConflict: 'user_id,tournament_id,category' });
+
+              if (error && (error.code === '42501' || /row-level security/i.test(error.message || ''))) {
+                  // Server-side lock (RLS): category or tournament picks are locked
+                  showToast('error', 'Picks are locked for this category');
+                  return false;
+              }
+              if (error && error.code !== '42P01') { // 42P01 is relation does not exist
+                  console.error("Error saving picks to DB:", error);
+              }
+          } catch (dbErr) {
+              console.error("DB error saving picks:", dbErr);
+          }
+      }
+
       setAllUserPicks(prev => ({
           ...prev,
           [tournamentId]: {
@@ -592,28 +726,28 @@ const App: React.FC = () => {
       } catch (e) {
           console.error("Failed to persist picks to localStorage:", e);
       }
+      return true;
+  };
 
-      // DB Save: requires user_picks table in Supabase
-      if (userProfile?.id) {
-          try {
-              const { error } = await supabase
-                  .from('user_picks')
-                  .upsert({
-                      user_id: userProfile.id,
-                      tournament_id: tournamentId,
-                      category: category,
-                      picks_data: picks,
-                      completion_percentage: completion,
-                      updated_at: new Date().toISOString()
-                  }, { onConflict: 'user_id,tournament_id,category' });
-              
-              if (error && error.code !== '42P01') { // 42P01 is relation does not exist
-                  console.error("Error saving picks to DB:", error);
-              }
-          } catch (dbErr) {
-              console.error("DB error saving picks:", dbErr);
-          }
-      }
+  /** Admin: add/replace (points) or remove (null) a golden match on the selected tournament. */
+  const handleToggleGolden = async (category: string, matchId: string, points: number | null) => {
+    const t = selectedTournament;
+    if (!t) return;
+    const current: GoldenMatch[] = Array.isArray(t.goldenMatches) ? t.goldenMatches : [];
+    const rest = current.filter(g => !(g.matchId === matchId && weightsMatch(g.category, category)));
+    const next: GoldenMatch[] = points === null ? rest : [...rest, { category, matchId, points }];
+    const { error } = await supabase
+      .from('tournaments')
+      .update({ golden_matches: next })
+      .eq('id', t.id);
+    if (error) {
+      console.error('[handleToggleGolden] DB error:', error);
+      showToast('error', 'Error updating golden match.');
+      return;
+    }
+    setSelectedTournament(prev => prev && prev.id === t.id ? { ...prev, goldenMatches: next } : prev);
+    setTournaments(prev => prev.map(x => x.id === t.id ? { ...x, goldenMatches: next } : x));
+    showToast('success', points === null ? 'Golden match removed.' : `Golden match set (+${points} pts).`);
   };
 
   const renderContent = () => {
@@ -651,7 +785,8 @@ const App: React.FC = () => {
         }
         return <AdminDashboard 
             onNavigate={setCurrentView} 
-            onProceedToRoster={handleProceedToRoster} 
+            onProceedToRoster={handleProceedToRoster}
+            onProceedToBracket={handleProceedToBracket}
             initialData={draftTournament}
             initialStep={1}
         />;
@@ -662,7 +797,8 @@ const App: React.FC = () => {
         }
         return <AdminDashboard 
             onNavigate={setCurrentView} 
-            onProceedToRoster={handleProceedToRoster} 
+            onProceedToRoster={handleProceedToRoster}
+            onProceedToBracket={handleProceedToBracket}
             initialData={draftTournament}
             initialStep={2}
         />;
@@ -700,6 +836,7 @@ const App: React.FC = () => {
             onStatusChange={handleStatusChange}
             categoryStatuses={categoryStatuses}
             medalTableStatus={medalTableStatus}
+            onToggleGolden={handleToggleGolden}
         />;
       case 'MEDAL_TABLE_PICKS':
         return (
@@ -741,6 +878,10 @@ const App: React.FC = () => {
             onMedalTableLock={handleMedalTableLock}
             onMedalTableReopen={handleMedalTableReopen}
             medalTableStatus={medalTableStatus}
+            onLockAllPicks={handleLockAllPicks}
+            onUnlockAllPicks={handleUnlockAllPicks}
+            categoryInfos={categoryInfos}
+            onSetCategoryDay={handleSetCategoryDay}
         />;
       case 'TOURNAMENT_LEADERBOARD':
         return <Leaderboard 
@@ -762,6 +903,7 @@ const App: React.FC = () => {
             onNavigate={setCurrentView} 
             userProfile={userProfile} 
             refreshProfile={refreshProfile} 
+            tournaments={tournaments}
         />;
       default:
         return <Home 
@@ -800,7 +942,7 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-background-light">
+    <div className="app-shell flex flex-col h-screen bg-background-light">
       <Toast />
       {currentView !== 'BUILD_BRACKET' && currentView !== 'MANAGE_ROSTER' && currentView !== 'TOURNAMENT_RESULTS' && (
         <Navigation
@@ -809,7 +951,7 @@ const App: React.FC = () => {
             userProfile={userProfile}
         />
       )}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
         {renderContent()}
       </div>
     </div>

@@ -79,11 +79,14 @@ export function buildMatchesForBracket(
     if (!m) return null;
     if (m[idField] && rosterMap[m[idField]]) return rosterMap[m[idField]];
     const bd = m?.bracket_data;
-    if (bd && bd[slot] && bd[slot].name) {
+    const entry = bd?.[slot];
+    // Stable id from bracket_data (new shape) — prefer the roster entry when it exists
+    if (entry && entry.id && rosterMap[entry.id]) return rosterMap[entry.id];
+    if (entry && (entry.name || entry.id)) {
       return {
-        id: `pdf-${m.id}-${slot}`,
-        name: bd[slot].name,
-        country: bd[slot].country || 'N/A',
+        id: entry.id ? String(entry.id) : `pdf-${m.id}-${slot}`,
+        name: entry.name || String(entry.id),
+        country: entry.country || 'N/A',
         flagUrl: '',
       };
     }
@@ -104,6 +107,9 @@ export function buildMatchesForBracket(
     } else if (fullR1Count === 2) {
       pool = i === 0 ? 'A' : 'B';
     }
+    // Pool stored by the draw parser overrides the computed one
+    const storedPool = m?.bracket_data?.pool;
+    if (typeof storedPool === 'string' && storedPool) pool = storedPool;
 
     freshMatches.push({
       id: m?.id || `r1-m${i}-${categoryLabel}`,
@@ -230,20 +236,37 @@ export function buildMatchesForBracket(
 // ── Standings Derivation ──────────────────────────────────────────────────────
 
 /**
+ * Resolves the stored winner id to the competitor actually in the match.
+ * Returns undefined winner when the id matches neither competitor (stale result/pick).
+ */
+function resolveWinnerLoser(
+  match: Match,
+  winnerId: string | undefined
+): { winner: Competitor | null; loser: Competitor | null } | undefined {
+  if (!winnerId) return undefined;
+  if (match.competitor1?.id === winnerId) return { winner: match.competitor1, loser: match.competitor2 };
+  if (match.competitor2?.id === winnerId) return { winner: match.competitor2, loser: match.competitor1 };
+  return undefined;
+}
+
+/**
  * Simulates a bracket by applying picks/results to propagate competitors
  * through each round. Returns a new match array with competitors filled in.
  * `picks` works for both user predictions and actual results: {matchId: winnerId}.
  */
-function simulateBracket(matches: Match[], picks: Record<string, string>): Match[] {
+export function simulateBracket(matches: Match[], picks: Record<string, string>): Match[] {
   const working = matches.map(m => ({ ...m }));
   const rounds = sortedUniqueRounds(working);
 
   for (const round of rounds) {
     for (const match of working.filter(m => m.round === round)) {
-      const winnerId = picks[match.id];
-      if (!winnerId) continue;
-      const winner = match.competitor1?.id === winnerId ? match.competitor1 : match.competitor2;
-      const loser  = match.competitor1?.id === winnerId ? match.competitor2  : match.competitor1;
+      let wl = resolveWinnerLoser(match, picks[match.id]);
+      // R1 bye (one side empty, either slot): auto-advance the present competitor
+      if (!wl && match.round === 'R1' && !!match.competitor1 !== !!match.competitor2) {
+        wl = { winner: match.competitor1 || match.competitor2, loser: null };
+      }
+      if (!wl) continue;
+      const { winner, loser } = wl;
       if (winner && match.nextMatchId) {
         const target = working.find(m => m.id === match.nextMatchId);
         if (target) {
@@ -278,35 +301,35 @@ export function deriveStandings(matches: Match[], picks: Record<string, string>)
   // 1st & 2nd — Final
   const finalM = sim.find(m => m.round === 'F');
   if (finalM) {
-    const wId = picks[finalM.id];
-    if (wId) {
-      push(1, finalM.competitor1?.id === wId ? finalM.competitor1 : finalM.competitor2);
-      push(2, finalM.competitor1?.id === wId ? finalM.competitor2  : finalM.competitor1);
+    const wl = resolveWinnerLoser(finalM, picks[finalM.id]);
+    if (wl) {
+      push(1, wl.winner);
+      push(2, wl.loser);
     }
   }
 
   // 3rd & 5th — Bronze matches
   const bronzeMs = sim.filter(m => m.round === 'B');
   for (const bm of bronzeMs) {
-    const wId = picks[bm.id];
-    if (wId) {
-      push(3, bm.competitor1?.id === wId ? bm.competitor1 : bm.competitor2);
-      push(5, bm.competitor1?.id === wId ? bm.competitor2  : bm.competitor1);
+    const wl = resolveWinnerLoser(bm, picks[bm.id]);
+    if (wl) {
+      push(3, wl.winner);
+      push(5, wl.loser);
     }
   }
 
   // Without repechage: SF losers = 3rd
   if (bronzeMs.length === 0) {
     for (const sf of sim.filter(m => m.round === 'SF')) {
-      const wId = picks[sf.id];
-      if (wId) push(3, sf.competitor1?.id === wId ? sf.competitor2 : sf.competitor1);
+      const wl = resolveWinnerLoser(sf, picks[sf.id]);
+      if (wl) push(3, wl.loser);
     }
   }
 
   // 7th — Repechage match losers
   for (const rm of sim.filter(m => m.round === 'REP')) {
-    const wId = picks[rm.id];
-    if (wId) push(7, rm.competitor1?.id === wId ? rm.competitor2 : rm.competitor1);
+    const wl = resolveWinnerLoser(rm, picks[rm.id]);
+    if (wl) push(7, wl.loser);
   }
 
   return out.sort((a, b) => a.position - b.position);

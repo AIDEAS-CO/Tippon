@@ -2,12 +2,13 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ViewState, Tournament, Match, Competitor, CategoryStandings } from '../types';
 import { supabase } from '../lib/supabaseClient';
 import { calculateAllCategoryScores, calculateScores, calculateBonusesAndMedalTable } from '../lib/scoringEngine';
-import { CategoryStatus } from '../types';
+import { CategoryStatus, TournamentCategoryInfo } from '../types';
+import { weightsMatch as weightLabelsMatch } from '../lib/rankings';
 import Flag from '../components/ui/Flag';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   ArrowLeft, ChevronDown, Loader2, Trophy, CheckCircle, Calculator,
-  Lock, AlertCircle, Check, FileUp, Upload, X, Trash2,
+  Lock, AlertCircle, Check, FileUp, Upload, X, Trash2, Unlock, CalendarDays,
 } from 'lucide-react';
 import { buildMatchesForBracket, deriveStandings, sortedUniqueRounds } from '../lib/bracketUtils';
 import { computeCountryMedalRanking } from '../lib/countryMedalRanking';
@@ -346,6 +347,20 @@ interface TournamentResultsProps {
   onMedalTableLock?: (tournamentId: string) => Promise<void>;
   onMedalTableReopen?: (tournamentId: string) => Promise<void>;
   medalTableStatus?: 'open' | 'locked';
+  onLockAllPicks?: (tournamentId: string) => Promise<void>;
+  onUnlockAllPicks?: (tournamentId: string) => Promise<void>;
+  /** `categories` rows (name, day, …) for the Days panel. */
+  categoryInfos?: TournamentCategoryInfo[];
+  onSetCategoryDay?: (tournamentId: string, categoryName: string, day: number | null) => Promise<void>;
+}
+
+/** Number of competition days offered in the Days panel: max(4, inclusive span start..end). */
+function dayOptionCount(start?: string, end?: string): number {
+  if (!start || !end) return 4;
+  const a = Date.parse(start);
+  const b = Date.parse(end);
+  if (isNaN(a) || isNaN(b) || b < a) return 4;
+  return Math.max(4, Math.round((b - a) / 86_400_000) + 1);
 }
 
 const TournamentResults: React.FC<TournamentResultsProps> = ({
@@ -360,7 +375,42 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
   onMedalTableLock,
   onMedalTableReopen,
   medalTableStatus = 'open',
+  onLockAllPicks,
+  onUnlockAllPicks,
+  categoryInfos = [],
+  onSetCategoryDay,
 }) => {
+  const [isTogglingGlobalLock, setIsTogglingGlobalLock] = useState(false);
+  const [showDaysPanel, setShowDaysPanel] = useState(false);
+  const picksLocked = !!tournament?.picksLocked;
+
+  /** Status of a bracket category; falls back to normalized weight matching against `categories.name`. */
+  const statusOf = (cat: string): CategoryStatus | undefined => {
+    if (!categoryStatuses) return undefined;
+    if (categoryStatuses[cat]) return categoryStatuses[cat];
+    const key = Object.keys(categoryStatuses).find(k => weightLabelsMatch(k, cat));
+    return key ? categoryStatuses[key] : undefined;
+  };
+
+  const handleToggleGlobalLock = async () => {
+    if (!tournament?.id) return;
+    if (picksLocked) {
+      if (!onUnlockAllPicks) return;
+      if (!confirm(
+        'Unlock all picks?\n\nThis removes the global lock only. Categories that are locked stay locked — reopen them individually to allow picks again.'
+      )) return;
+      setIsTogglingGlobalLock(true);
+      try { await onUnlockAllPicks(tournament.id); } finally { setIsTogglingGlobalLock(false); }
+    } else {
+      if (!onLockAllPicks) return;
+      if (!confirm(
+        'Lock all picks?\n\nPlayers will no longer be able to edit any picks (all open categories and the medal table will be locked). The tournament will be marked LIVE.'
+      )) return;
+      setIsTogglingGlobalLock(true);
+      try { await onLockAllPicks(tournament.id); } finally { setIsTogglingGlobalLock(false); }
+    }
+  };
+
   const [matches, setMatches] = useState<Match[]>([]);
   const [results, setResults] = useState<Record<string, string>>({});
   const [champion, setChampion] = useState<Competitor | null>(null);
@@ -714,7 +764,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
     setMessage({ type: 'info', text: `Calculating scores for ${categoryName}...` });
 
     try {
-      const result = await calculateScores(tournament.id, categoryName);
+      const result = await calculateScores(tournament.id, categoryName, tournament.goldenMatches);
       if (!result.success && result.error) {
         console.warn('[CloseCategory] score error:', result.error);
       }
@@ -739,7 +789,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
     setPreviewCategory(null);
     setMessage({ type: 'info', text: `Calculating preview scores for ${categoryName}...` });
     try {
-      const result = await calculateScores(tournament.id, categoryName);
+      const result = await calculateScores(tournament.id, categoryName, tournament.goldenMatches);
       if (result.success) {
         // Fetch saved scores + profile names for display
         const { data: scoreRows } = await supabase
@@ -796,7 +846,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
 
     try {
       // Step 1: Calculate scores
-      const scoreResult = await calculateAllCategoryScores(tournament.id, categories);
+      const scoreResult = await calculateAllCategoryScores(tournament.id, categories, tournament.goldenMatches);
       if (!scoreResult.success && scoreResult.errors.length > 0) {
         // Non-fatal — warn but continue
         console.warn('[Finalize] Score calculation errors:', scoreResult.errors);
@@ -929,7 +979,8 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
                           }`}
                         >
                           <span className="flex-1">{cat}</span>
-                          {categoryStatuses?.[cat] === 'closed' && <Lock size={12} className="text-slate-400" />}
+                          {statusOf(cat) === 'closed' && <Lock size={12} className="text-slate-400" />}
+                          {statusOf(cat) === 'locked' && <Lock size={12} className="text-amber-500" />}
                         </button>
                       </li>
                     ))}
@@ -965,7 +1016,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
           </button>
 
           {/* Per-category pick lock/reopen */}
-          {selectedCategory && categoryStatuses?.[selectedCategory] === 'open' && onCategoryLock && (
+          {selectedCategory && statusOf(selectedCategory) === 'open' && onCategoryLock && (
             <button
               onClick={() => onCategoryLock(tournament!.id, selectedCategory)}
               className="bg-amber-500 text-white px-4 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-amber-600 transition-colors text-sm"
@@ -974,7 +1025,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
               Lock Picks
             </button>
           )}
-          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
+          {selectedCategory && statusOf(selectedCategory) === 'locked' && (
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 text-amber-700 rounded-lg border border-amber-200 text-sm font-bold">
                 <Lock size={14} />
@@ -992,7 +1043,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
           )}
 
           {/* Preview Scores — calculates without closing category */}
-          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
+          {selectedCategory && statusOf(selectedCategory) === 'locked' && (
             <button
               onClick={() => handlePreviewScores(selectedCategory)}
               disabled={isPreviewingScores || isClosingCategory}
@@ -1004,7 +1055,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
           )}
 
           {/* Close current category — scores & finalizes this category */}
-          {selectedCategory && categoryStatuses?.[selectedCategory] === 'locked' && (
+          {selectedCategory && statusOf(selectedCategory) === 'locked' && (
             <button
               onClick={() => handleCloseCategory(selectedCategory)}
               disabled={isClosingCategory || isPreviewingScores}
@@ -1014,7 +1065,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
               Score & Close
             </button>
           )}
-          {selectedCategory && categoryStatuses?.[selectedCategory] === 'closed' && (
+          {selectedCategory && statusOf(selectedCategory) === 'closed' && (
             <div className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-500 rounded-lg border border-slate-200 text-sm font-bold">
               <Lock size={14} />
               {selectedCategory} closed
@@ -1022,7 +1073,7 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
           )}
 
           {/* Delete current category */}
-          {selectedCategory && categoryStatuses?.[selectedCategory] !== 'closed' && onCategoryDelete && (
+          {selectedCategory && statusOf(selectedCategory) !== 'closed' && onCategoryDelete && (
             <button
               onClick={() => onCategoryDelete(tournament!.id, selectedCategory)}
               className="bg-red-50 text-red-600 border border-red-200 px-3 py-2 rounded-lg font-bold flex items-center gap-2 hover:bg-red-100 transition-colors text-sm"
@@ -1059,6 +1110,29 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
             </div>
           )}
 
+          {/* Global pick lock */}
+          {(onLockAllPicks || onUnlockAllPicks) && (
+            <div className="flex items-center gap-1">
+              <span className={`text-[10px] font-black px-2 py-1 rounded-full uppercase tracking-wide ${
+                picksLocked ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700'
+              }`}>
+                {picksLocked ? 'All picks locked' : 'Picks open'}
+              </span>
+              <button
+                onClick={handleToggleGlobalLock}
+                disabled={isTogglingGlobalLock}
+                className={`px-3 py-2 rounded-lg font-bold flex items-center gap-2 transition-colors text-sm disabled:opacity-50 ${
+                  picksLocked
+                    ? 'bg-white text-red-600 border border-red-300 hover:bg-red-50'
+                    : 'bg-red-600 text-white hover:bg-red-700'
+                }`}
+              >
+                {isTogglingGlobalLock ? <Loader2 className="animate-spin" size={15} /> : picksLocked ? <Unlock size={15} /> : <Lock size={15} />}
+                {picksLocked ? 'Unlock all picks' : 'Lock all picks'}
+              </button>
+            </div>
+          )}
+
           {/* Finalize & Close All — scores all remaining open categories + closes tournament */}
           <button
             onClick={handleFinalizeTournament}
@@ -1085,6 +1159,41 @@ const TournamentResults: React.FC<TournamentResultsProps> = ({
            <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />}
           <span className="flex-1 whitespace-pre-line">{message.text}</span>
           <button onClick={() => setMessage(null)} className="flex-shrink-0"><X size={14} /></button>
+        </div>
+      )}
+
+      {/* Days panel — competition day per category (drives per-day leaderboards) */}
+      {onSetCategoryDay && categoryInfos.length > 0 && (
+        <div className="mx-4 mt-3 bg-white rounded-xl border border-slate-200 shadow-sm">
+          <button
+            onClick={() => setShowDaysPanel(v => !v)}
+            className="w-full flex items-center justify-between px-4 py-3 text-sm font-bold text-slate-700"
+          >
+            <span className="flex items-center gap-2"><CalendarDays size={16} className="text-slate-500" /> Competition days</span>
+            <ChevronDown size={16} className={`transition-transform ${showDaysPanel ? 'rotate-180' : ''}`} />
+          </button>
+          {showDaysPanel && (() => {
+            const n = dayOptionCount(tournament?.date, (tournament as any)?.end_date);
+            return (
+              <div className="px-4 pb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                {[...categoryInfos].sort((a, b) => a.name.localeCompare(b.name)).map(c => (
+                  <label key={c.name} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-slate-100 bg-slate-50 text-sm">
+                    <span className="font-semibold text-slate-700 truncate">{c.name}</span>
+                    <select
+                      value={c.day ?? ''}
+                      onChange={e => onSetCategoryDay(tournament!.id, c.name, e.target.value ? Number(e.target.value) : null)}
+                      className="border border-slate-200 rounded-md px-2 py-1 text-sm bg-white"
+                    >
+                      <option value="">—</option>
+                      {Array.from({ length: n }, (_, i) => i + 1).map(d => (
+                        <option key={d} value={d}>Day {d}</option>
+                      ))}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            );
+          })()}
         </div>
       )}
 

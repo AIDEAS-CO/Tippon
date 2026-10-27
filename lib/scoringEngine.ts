@@ -7,8 +7,12 @@ import {
   TournamentBonusBreakdown,
   MedalTableScoreBreakdown,
   MedalTableScoreLine,
+  GoldenMatch,
+  GoldenMatchScoreLine,
+  Match,
 } from '../types';
 import { buildMatchesForBracket, deriveStandings, getQFParticipants } from './bracketUtils';
+import { weightsMatch } from './rankings';
 import { computeCountryMedalRanking, countryRanksFromMedalRows } from './countryMedalRanking';
 import { MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL } from './tournamentConstants';
 
@@ -42,24 +46,50 @@ const DEFAULTS: Record<string, number> = {
   bonus_all_pools:       5,
 };
 
-function getCfg(config: Record<string, any> | null | undefined, key: string): number {
+/** Configured value for a rule; a stored 0 disables the rule. Missing key → default. */
+export function getCfg(config: Record<string, any> | null | undefined, key: string): number {
   if (config && typeof config[key] === 'number') return config[key];
   return DEFAULTS[key] ?? 0;
 }
 
 // ── Pure scoring function ─────────────────────────────────────────────────────
 
+/** Index of each placement in the final ranking order 1, 2, 3, 5, 7. */
+const RANK_INDEX: Record<number, number> = { 1: 0, 2: 1, 3: 2, 5: 3, 7: 4 };
+
+/** Rank-step distance between two placements (3rd→5th = 1, 3rd→7th = 2); 99 when actual is missing. */
+export function rankStepDistance(predicted: number, actual: number | null): number {
+  if (actual === null) return 99;
+  const p = RANK_INDEX[predicted];
+  const a = RANK_INDEX[actual];
+  if (p === undefined || a === undefined) return 99;
+  return Math.abs(p - a);
+}
+
+/** Golden matches configured for this category (weight-label tolerant). */
+export function goldenMatchesForCategory(
+  goldenMatches: GoldenMatch[] | null | undefined,
+  category: string
+): GoldenMatch[] {
+  if (!Array.isArray(goldenMatches)) return [];
+  return goldenMatches.filter((g) => g && g.matchId && weightsMatch(g.category, category));
+}
+
 /**
  * Scores one user's predictions against actual results for a single category.
  * All inputs are pre-computed; no DB access.
+ * `goldenMatches` must already be filtered to this category; `actualResults` is matchId → winner id.
  */
-function scoreCategory(
+export function scoreCategory(
   predictedStandings: CategoryStandings[],
   actualStandings: CategoryStandings[],
   predictedQF: string[],
   actualQF: string[],
   picks: Record<string, string>,
-  config: Record<string, any> | null | undefined
+  config: Record<string, any> | null | undefined,
+  goldenMatches: GoldenMatch[] = [],
+  actualResults: Record<string, string> = {},
+  matches: Match[] = []
 ): { total: number; breakdown: ScoringBreakdown } {
   const actualPos = new Map(actualStandings.map(s => [s.competitorId, s.position]));
 
@@ -68,7 +98,7 @@ function scoreCategory(
     group: 'goldSilver' | 'bronze'
   ): PositionScoreDetail => {
     const actual = actualPos.get(pred.competitorId) ?? null;
-    const deviation = actual !== null ? Math.abs(pred.position - actual) : 99;
+    const deviation = rankStepDistance(pred.position, actual);
     let points = 0;
     if (group === 'goldSilver') {
       if (deviation === 0) points = getCfg(config, 'gold_silver_exact');
@@ -109,10 +139,32 @@ function scoreCategory(
         ? getCfg(config, 'additional_pick_top7')
         : 0;
 
+  // Golden matches: extra points when the user's pick equals the actual winner
+  const nameById = new Map<string, string>();
+  for (const m of matches) {
+    for (const c of [m.competitor1, m.competitor2]) if (c) nameById.set(c.id, c.name);
+  }
+  const goldenLines: GoldenMatchScoreLine[] = goldenMatches.map((g) => {
+    const match = matches.find((m) => m.id === g.matchId);
+    const pickedId = picks[g.matchId] || null;
+    const winnerId = actualResults[g.matchId] || null;
+    const hit = !!pickedId && !!winnerId && pickedId === winnerId;
+    return {
+      matchId: g.matchId,
+      round: match?.round,
+      pickedId,
+      pickedName: pickedId ? nameById.get(pickedId) : undefined,
+      winnerId,
+      winnerName: winnerId ? nameById.get(winnerId) : undefined,
+      points: hit ? Number(g.points) || 0 : 0,
+    };
+  });
+  const goldenPoints = goldenLines.reduce((s, l) => s + l.points, 0);
+
   const categoryTotal =
     goldSilver.reduce((s, d) => s + d.points, 0) +
     bronze.reduce((s, d) => s + d.points, 0) +
-    pfPoints + apPoints;
+    pfPoints + apPoints + goldenPoints;
 
   return {
     total: categoryTotal,
@@ -121,6 +173,7 @@ function scoreCategory(
       bronze,
       poolFinals: { correct: correctQF, total: actualQF.length, points: pfPoints },
       additionalPick: { competitorId: apId, actualPosition: apActualPos, points: apPoints },
+      ...(goldenLines.length > 0 ? { goldenLines } : {}),
       categoryTotal,
     },
   };
@@ -160,19 +213,21 @@ async function loadBracketForCategory(tournamentId: string | number, category: s
  */
 export async function calculateScores(
   tournamentId: string | number,
-  category: string
+  category: string,
+  goldenMatches?: GoldenMatch[]
 ): Promise<{ success: boolean; error?: string; usersScored?: number; categoryResults?: ScoringCategoryResult[] }> {
   try {
-    // Load tournament config
+    // Load tournament config (select * so a missing golden_matches column does not fail)
     const { data: tournamentData, error: tErr } = await supabase
       .from('tournaments')
-      .select('scoring_configuration')
+      .select('*')
       .eq('id', tournamentId)
       .single();
     if (tErr) throw tErr;
 
     const config: Record<string, any> = tournamentData?.scoring_configuration ?? {};
     const hasRepechage = !!config.has_repechage;
+    const golden = goldenMatchesForCategory(goldenMatches ?? tournamentData?.golden_matches, category);
 
     // Build match structure
     const matches = await loadBracketForCategory(tournamentId, category, hasRepechage);
@@ -213,7 +268,10 @@ export async function calculateScores(
     for (const pick of allPicks as { user_id: string; picks_data: Record<string, string> }[]) {
       const predicted = deriveStandings(matches, pick.picks_data);
       const predictedQF = getQFParticipants(matches, pick.picks_data);
-      const { total, breakdown } = scoreCategory(predicted, actualStandings, predictedQF, actualQF, pick.picks_data, config);
+      const { total, breakdown } = scoreCategory(
+        predicted, actualStandings, predictedQF, actualQF, pick.picks_data, config,
+        golden, actualPicksMap, matches
+      );
       scoreRows.push({
         user_id: pick.user_id,
         tournament_id: tournamentId,
@@ -268,16 +326,18 @@ export async function calculateMyScore(
   tournamentId: string | number,
   category: string,
   userId: string,
-  myPicks: Record<string, string>
+  myPicks: Record<string, string>,
+  goldenMatches?: GoldenMatch[]
 ): Promise<{ points: number; correct: number; total: number }> {
   try {
     const { data: tournamentData } = await supabase
       .from('tournaments')
-      .select('scoring_configuration')
+      .select('*')
       .eq('id', tournamentId)
       .single();
     const config: Record<string, any> = tournamentData?.scoring_configuration ?? {};
     const hasRepechage = !!config.has_repechage;
+    const golden = goldenMatchesForCategory(goldenMatches ?? tournamentData?.golden_matches, category);
 
     const [matches, resultsData] = await Promise.all([
       loadBracketForCategory(tournamentId, category, hasRepechage),
@@ -297,7 +357,10 @@ export async function calculateMyScore(
     const predicted = deriveStandings(matches, myPicks);
     const predictedQF = getQFParticipants(matches, myPicks);
 
-    const { total, breakdown } = scoreCategory(predicted, actualStandings, predictedQF, actualQF, myPicks, config);
+    const { total, breakdown } = scoreCategory(
+      predicted, actualStandings, predictedQF, actualQF, myPicks, config,
+      golden, actualPicksMap, matches
+    );
 
     // Persist
     await supabase.from('tournament_scores').upsert(
@@ -448,6 +511,21 @@ function calculateBonusesDetailed(
 
 const MEDAL_TABLE_SLOTS = 3;
 
+/**
+ * Split categories for the Men/Women medal tables. Only exact 'Male'/'Female' gender
+ * counts; 'Mixed' (e.g. Mixed Teams) and unknown categories appear only in Total.
+ */
+export function splitMedalTableCategories(
+  categories: string[],
+  catGenderMap: Map<string, string>
+): { menCats: string[]; womenCats: string[]; totalCats: string[] } {
+  return {
+    menCats: categories.filter((c) => catGenderMap.get(c) === 'Male'),
+    womenCats: categories.filter((c) => catGenderMap.get(c) === 'Female'),
+    totalCats: categories,
+  };
+}
+
 async function refreshProfilePointsFromAllScores(userId: string) {
   const { data: allScores } = await supabase.from('tournament_scores').select('total_points').eq('user_id', userId);
   if (allScores) {
@@ -509,9 +587,8 @@ export async function calculateMedalTableScores(
       resultsByCat.get(row.category)![row.match_id] = row.winner_competitor_id;
     }
 
-    // Build gender-filtered category lists
-    const menCats = categories.filter(c => catGenderMap.get(c) === 'Male');
-    const womenCats = categories.filter(c => catGenderMap.get(c) === 'Female');
+    // Build gender-filtered category lists (Mixed only counts toward Total)
+    const { menCats, womenCats } = splitMedalTableCategories(categories, catGenderMap);
 
     const tableConfigs: Array<{ catKey: string; filteredCats: string[]; legacyKey?: string }> = [
       { catKey: MEDAL_TABLE_MEN, filteredCats: menCats },
@@ -623,14 +700,15 @@ export async function calculateMedalTableScores(
 
 export async function calculateAllCategoryScores(
   tournamentId: string | number,
-  categories: string[]
+  categories: string[],
+  goldenMatches?: GoldenMatch[]
 ): Promise<{ success: boolean; totalUsersScored: number; errors: string[] }> {
   let totalUsersScored = 0;
   const errors: string[] = [];
   const allResults: ScoringCategoryResult[] = [];
 
   for (const category of categories) {
-    const result = await calculateScores(tournamentId, category);
+    const result = await calculateScores(tournamentId, category, goldenMatches);
     if (result.success) {
       totalUsersScored += result.usersScored || 0;
       if (result.categoryResults?.length) {
@@ -721,7 +799,7 @@ export async function calculateBonusesAndMedalTable(
       const breakdown = (row as any).breakdown as ScoringBreakdown;
       if (!breakdown || !('poolFinals' in breakdown)) continue;
       if (!byUser.has(uid)) byUser.set(uid, []);
-      byUser.get(uid)!.push({ userId: uid, category: cat, breakdown, total: breakdown.categoryTotal });
+      byUser.get(uid)!.push({ userId: uid, category: cat, breakdown });
     }
 
     const allResults: ScoringCategoryResult[] = [];

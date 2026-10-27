@@ -30,18 +30,37 @@ All user-facing copy, developer comments in source files, and in-repo technical 
 | Backend/DB  | Supabase (Auth, PostgreSQL, Storage)             |
 | AI          | Google Gemini API (`@google/genai` SDK v1.48+)   |
 | Icons       | Lucide React                                     |
-| PDF parsing | pdfjs-dist (unused currently; Gemini reads PDFs) |
-| Excel       | xlsx (SheetJS) for roster imports                |
+| PDF parsing | pdfjs-dist — local draw-PDF parser (`lib/drawPdfParser.ts`); Gemini only for results PDFs and scanned draws |
+| Drag & drop | @dnd-kit/core (bracket builder pool grid)       |
+| Excel       | xlsx (SheetJS) for optional roster imports       |
+| Tests       | vitest (`npm test`), `npm run typecheck` (`tsc --noEmit`) |
 | Deployment  | Vercel                                           |
+
+**Commands:** `npm run dev` (port 3000), `npm run build`, `npm run preview`, `npm test` (vitest run, `tests/*.test.ts`), `npm run typecheck` (2 known errors in `lib/supabaseClient.ts`: `import.meta.env` typing).
 
 ### Key Flows
 
-1. **Admin creates tournament** → `AdminDashboard` → saves to `tournaments` table
-2. **Admin uploads roster** (Excel `.xlsx` / `.xls` or `.csv`) → `TournamentRoster` → reads **all worksheets** with `defval`, normalizes weight labels to tournament categories → `tournament_roster`
-3. **Admin uploads Draw PDF** → `BuildBracket` → Gemini extracts brackets → saves to `competition_brackets`
-4. **Player views bracket** → `TournamentBracket` → picks winners → saves to local state (predictions planned)
-5. **Leaderboard** → `Leaderboard` → shows rankings from `profiles` / `player_rankings`
-6. **Medal table picks** → `MedalTablePicks` (`ViewState`: `MEDAL_TABLE_PICKS`) → user ranks countries; saved in `user_picks` with `category = '_medal_table_'` and `picks_data` keys `"1"`…`"10"` → IOC country codes
+1. **Admin creates tournament** → `AdminDashboard` wizard: `CREATE_TOURNAMENT` (name, start + optional **End Date** → `tournaments.end_date`, categories with **Day** per category → `categories.day`, **Mixed Teams** checkbox → category `Teams` with gender `Mixed`) → `SCORING_RULES` → **Save & Build Brackets** → `BUILD_BRACKET`
+2. **Roster upload is optional** (Excel `.xlsx` / `.xls` or `.csv`) → `MANAGE_ROSTER` / `TournamentRoster` → reads **all worksheets** with `defval`, normalizes weight labels → `tournament_roster`. Brackets no longer need a roster: athletes live in `competition_brackets.bracket_data`.
+3. **Admin builds brackets** → `BuildBracket` (see **Bracket builder** below) → publishes to `competition_brackets`, status → `upcoming`
+4. **Player views bracket** → `TournamentBracket` → picks winners → `handleSavePicks` upserts `user_picks` (DB first; localStorage cache only after success). Rejected by RLS when picks are locked.
+5. **Leaderboard** → `Leaderboard` → rankings aggregated live from `tournament_scores` (Total + per-day tabs)
+6. **Medal table picks** → `MedalTablePicks` (`ViewState`: `MEDAL_TABLE_PICKS`) → user ranks countries in 3 tabs (Men / Women / Total); saved in `user_picks` with `category` = `_medal_table_men_` / `_medal_table_women_` / `_medal_table_total_` and `picks_data` keys `"1"`…`"3"` → IOC country codes (legacy `_medal_table_` rows are read as Total)
+
+### Bracket builder (`BuildBracket.tsx`, v2)
+
+- **Import:** `DrawImportPanel` accepts one or more draw PDFs. `lib/drawPdfParser.ts` parses the pdfjs text layer deterministically (one category per page: header weight + declared count, IOC-code rows → draw positions via R1 fight numbers, lattice fallback). Pages without a text layer fall back to Gemini (`components/bracketBuilder/aiDrawExtraction.ts`, model `gemini-2.5-flash`), marked `source: 'ai'` for review. Parsed weights are matched to configured `categories.name` with `normalizeWeightKey` (strips gender prefix, spaces, `kg`); unmatched categories can be added (inserted into `categories`) or ignored.
+- **Draft model** (`lib/bracketDraft.ts`, pure): `BracketDraft { version: 1, updatedAt, categories: Record<name, DraftCategory> }`; `DraftCategory { weight, gender, fieldSize (8–128), slots[], unassigned[], warnings, source, reviewed, declaredCount }`. Slot index = draw position (Pool A first); R1 fight k = `slots[2k]` vs `slots[2k+1]`. Athletes `{ id: 'ath-<uuid>', name, country }`. Helpers: `moveToSlot`, `moveToUnassigned`, `swapSlots`, `setFieldSize`, `validateCategory`, `draftToBracketRows`, `rowsToDraftCategory` (rebuild from published rows, ids mirror `buildMatchesForBracket`).
+- **Editor:** `BracketEditor` + `PoolGrid` (4 pools, drag & drop with @dnd-kit/core) + `UnassignedTray`; manual mode creates empty brackets of a chosen field size.
+- **Autosave** (`useDraftAutosave`): every change → localStorage `tippon-bracket-draft-${tournamentId}` immediately and `tournaments.bracket_draft` / `bracket_draft_updated_at` debounced; on load the newer `updatedAt` wins; degrades to device-only if the columns are missing. Without a draft, published rows are loaded for editing.
+- **Publish:** blocks on validation errors, confirms warnings / unreviewed categories / existing picks, then per category maps `draftToBracketRows` onto existing `competition_brackets` rows by `match_number` → `upsert` with the **existing row id** (so `user_picks`, `match_results` and golden match ids stay valid), `insert` for new fights, `delete` for surplus fights and categories removed from the draft. Sets status `upcoming` (if draft) and clears the draft.
+
+### Player bracket (`TournamentBracket.tsx`, v2)
+
+- **Ids:** competitors use `bracket_data.competitorN.id` (fallback roster FK, then `pdf-${row.id}-competitorN`); R1 match id = `competition_brackets.id`; later rounds `r{level}-m{i}` (same in `buildMatchesForBracket` for picks, results, scoring, `UserPicksViewer`).
+- **Byes:** R1 fight with exactly one athlete (either side) auto-advances.
+- **Locks:** read-only if COMPLETED, category `locked`/`closed`, or `tournaments.picks_locked`; realtime channel on `categories` + `tournaments` refreshes lock state and golden matches.
+- **Mobile:** < 768px → `MobileBracketTabs` (round tabs with per-tab progress + Extra pick tab); otherwise zoomable tree (`BracketZoom`, pinch / buttons, zoom stored in localStorage). Sticky bottom bar (progress + Save) inside the App scroll container (`.app-shell` uses `100dvh`; safe-area padding).
 
 ### Frontend views (`ViewState` in `types.ts`)
 
@@ -49,21 +68,34 @@ Includes: `MEDAL_TABLE_PICKS` — opened from the bracket header while the tourn
 
 - `TOURNAMENT_FINAL_RESULTS` — after `COMPLETED`: tabs for standings per weight category and **country medal table**; total points; per-user `tournament_scores` breakdown (weight categories, `_medal_table_`, `_bonuses_`). Entry: **Final results** on tournament cards or bracket header.
 
-**Finalize / batch scoring order** (`calculateAllCategoryScores` in `lib/scoringEngine.ts`): (1) each weight category → `calculateScores`, (2) **`calculateMedalTableScores`** → row `category = '_medal_table_'`, (3) **`'_bonuses_'`** from `calculateBonusesDetailed` (weight-category results only).
+**Placement scoring:** deviation for gold/silver/bronze picks is the **rank-step distance** over placements 1→2→3→5→7 (`rankStepDistance` in `lib/scoringEngine.ts`; e.g. predicted 1st, actual 5th = 3 steps → `gold_silver_dev3`; missing actual = no points). Golden matches add `points` when the pick equals the actual winner (`breakdown.goldenLines`). Full point table in `SCORING.md`.
+
+**Finalize / batch scoring order** (`calculateAllCategoryScores` in `lib/scoringEngine.ts`): (1) each weight category → `calculateScores`, (2) **`calculateMedalTableScores`** → rows `_medal_table_men_` / `_medal_table_women_` / `_medal_table_total_`, (3) **`'_bonuses_'`** from `calculateBonusesDetailed` (weight-category results only).
 
 **`tournament_scores.breakdown` for `category = '_bonuses_'`:** JSON with `bonusLines` (array of `{ key, label, points, earned, detail, progressRatio?, progressLabel? }`) and `categoryTotal`, produced by `calculateBonusesDetailed`.
 
-**`tournament_scores.breakdown` for `category = '_medal_table_'`:** JSON `MedalTableScoreBreakdown`: `{ lines: [{ slot, country, predictedRank, actualRank, deviation, points }], categoryTotal, maxPossible }`, produced by `calculateMedalTableScores`.
+**`tournament_scores.breakdown` for `category` = `_medal_table_men_` / `_women_` / `_total_`:** JSON `MedalTableScoreBreakdown`: `{ lines: [{ slot, country, predictedRank, actualRank, deviation, points }], categoryTotal, maxPossible }`, produced by `calculateMedalTableScores`.
 
 ### Tournament results UI (`TournamentResults.tsx`)
 
 - **Final standings**: After the bracket (same scroll area), when the final has a winner and every bronze match (if any) has a winner, shows positions derived via `deriveStandings(matches, results)`.
 - **Country medal summary**: Collapsible table aggregates gold/silver/bronze counts by country across all weight categories (saved `match_results` only).
+- **Global lock**: header buttons **Lock all picks** / **Unlock all picks** (confirm dialog; badge shows state). Lock → `tournaments.picks_locked = true`, `status = 'live'`, `medal_table_status = 'locked'` (only if open/null), every `categories.status = 'open'` → `'locked'` (`handleLockAllPicks` in `App.tsx`). Unlock → `picks_locked = false` only; categories keep their status and must be reopened individually.
+- **Per-category lock** (`handleCategoryLock`): matches `categories.name` by normalized weight (`weightsMatch`), uses `.select()` to verify a row was updated, error toast otherwise. Category dropdown shows lock icons for `locked` (amber) and `closed` (grey).
+- **Competition days panel** (collapsible): Day 1..N select per category → `categories.day` (`handleSetCategoryDay`). N = max(4, inclusive days from `start_date` to `end_date`).
+- **Golden matches**: admin toggles in `TournamentBracket` call `handleToggleGolden(category, matchId, points|null)` in `App.tsx` → add/replace/remove in `tournaments.golden_matches`. Scoring calls pass `tournament.goldenMatches`.
+- **Pick saves rejected by RLS** (`42501` / "row-level security") → toast "Picks are locked for this category"; `handleSavePicks` resolves `false`.
 
 ### Leaderboard breakdown (`Leaderboard.tsx`)
 
 - **New**: `tournament_scores.breakdown` as `ScoringBreakdown` (gold/silver, bronze, pool finals, additional pick, category total) — see `types.ts`.
 - **Legacy**: Older rows with per-match `breakdown` maps grouped by round still render as before.
+- **Day tabs** (tournament view): `Total | Day 1 | Day 2 | …` from `buildDayRankings(tournament_scores rows, categories(name, day))` (`lib/rankings.ts`); default tab = latest day with scores. Ties share rank (1, 1, 3) in both tournament and global views.
+- **Reveal**: reveals rows from last place up to 1st (one every 400 ms), with Skip.
+- **Live refresh**: refetches on window focus and on realtime `tournament_scores` changes (filtered by `tournament_id` in tournament view).
+- **User modal**: tabs **Breakdown** (incl. ★ golden match lines; deviation shown as rank steps over 1→2→3→5→7, e.g. "2 steps off") and **Picks** (`components/UserPicksViewer.tsx`: read-only picks per round, additional pick, medal table picks; categories RLS hides show "Hidden until picks are locked"). Same Picks tab in `TournamentFinalResults`.
+- **Home / Profile**: Global rank computed from all `tournament_scores` (`aggregateRanking`); standing card for the current LIVE (else most recent COMPLETED) tournament the user scored in: Total `#x of N` + latest Day rank.
+- **Mixed categories**: Men/Women medal tables only count exact `Male`/`Female` category gender (`lookupByWeight` tolerates bracket-vs-category label differences); `Mixed`/unknown count in Total only.
 
 ---
 
@@ -83,6 +115,12 @@ Main tournament entity.
 | `scoring_configuration`| jsonb       | Extended scoring config                          |
 | `brackets`             | jsonb       | Legacy: stored bracket data (deprecated)         |
 | `roster`               | jsonb       | Legacy: stored roster data (deprecated)          |
+| `medal_table_status`   | text        | `open` (default), `locked`, `closed` — medal table picks lock (Migration 008) |
+| `picks_locked`         | boolean     | Default `false`. Global lock: when `true`, no picks can be written for any category (Migration 009) |
+| `bracket_draft`        | jsonb       | Draw-parser draft autosave (unpublished bracket work in `BuildBracket`) (Migration 009) |
+| `bracket_draft_updated_at` | timestamptz | Last autosave time of `bracket_draft` (Migration 009) |
+| `golden_matches`       | jsonb       | Default `[]`. `[{ category, matchId, points }]` — bonus points for correctly picking these matches; scored into that category's `tournament_scores.breakdown.goldenLines` (Migration 009) |
+| `end_date`             | date        | Last competition day, nullable (Migration 009)   |
 | `created_at`           | timestamptz | Auto-generated                                   |
 
 ### `categories`
@@ -93,7 +131,9 @@ Weight categories per tournament.
 | `id`            | bigint (PK) | Auto-generated identity          |
 | `tournament_id` | bigint (FK) | → `tournaments.id`              |
 | `name`          | text        | e.g., `-73kg`, `-90kg`          |
-| `gender`        | text        | `Male` or `Female`              |
+| `gender`        | text        | `Male`, `Female`, or `Mixed` (mixed team events, Migration 009) |
+| `status`        | text        | `open` (default), `locked`, `closed` (Migration 007/008). Enforced server-side for picks by `picks_open()` (Migration 009) |
+| `day`           | smallint    | Competition day (1, 2, …), nullable — used for day ranking (Migration 009) |
 | `created_at`    | timestamptz | Auto-generated                   |
 
 ### `tournament_roster`
@@ -117,15 +157,29 @@ Stores first-round matches extracted from PDF draws. Competitors reference `tour
 | Column          | Type        | Notes                                          |
 | --------------- | ----------- | ---------------------------------------------- |
 | `id`            | uuid (PK)   | Auto-generated                                 |
-| `tournament_id` | bigint (FK) | → `tournaments.id` (no explicit FK in schema)  |
+| `tournament_id` | bigint (FK) | → `tournaments.id` (ON DELETE CASCADE, Migration 006) |
+| `weight_category` | text      | Category name (Migration 001)                  |
 | `match_number`  | bigint      | Sequential match number                        |
 | `competitor_1`  | uuid (FK)   | → `tournament_roster.id` (nullable)            |
 | `competitor_2`  | uuid (FK)   | → `tournament_roster.id` (nullable)            |
-| `bracket_data`  | jsonb       | Optional extra data                            |
+| `bracket_data`  | jsonb       | First-round slot data — see shape below        |
 | `created_at`    | timestamptz | Auto-generated                                 |
 | `updated_at`    | timestamptz | Auto-generated                                 |
 
-> **Missing column:** `weight_category` (text) — needed to filter brackets by category in the UI. See [Migration 001](#migration-001).
+**Unique:** `(tournament_id, weight_category, match_number)` — constraint `competition_brackets_tournament_category_match_key` (Migration 009; used by the draw-parser publish upsert).
+
+**`bracket_data` shape (current):**
+
+```
+{
+  competitor1: { id: <draft athlete id 'ath-<uuid>' or tournament_roster uuid>, name, country } | null,
+  competitor2: { id, name, country } | null,
+  pool: 'A' | 'B' | 'C' | 'D',
+  slot: number
+}
+```
+
+Legacy rows with `competitor1` / `competitor2` as `{ name, country }` (no `id`) are still supported by the readers.
 
 ### `tournament_matches`
 Alternative match storage with richer schema. **Currently unused by the frontend** but has the ideal structure.
@@ -209,14 +263,28 @@ Stores each user's bracket predictions per tournament/category.
 | `id`                   | uuid (PK)   | Auto-generated                           |
 | `user_id`              | uuid (FK)   | → `auth.users.id`                       |
 | `tournament_id`        | bigint (FK) | → `tournaments.id`                      |
-| `category`             | text        | Weight category name                     |
-| `picks_data`           | jsonb       | `{ matchId: competitorId }` map          |
+| `category`             | text        | Weight category name, or medal table key `_medal_table_men_` / `_medal_table_women_` / `_medal_table_total_` |
+| `picks_data`           | jsonb       | Weight category: `{ matchId: competitorId }` map. Medal table: `{ "1": IOC, "2": IOC, "3": IOC }` |
 | `completion_percentage`| integer     | 0–100                                    |
 | `created_at`           | timestamptz | Auto-generated                           |
 | `updated_at`           | timestamptz | Auto-generated                           |
 
 **Unique:** `(user_id, tournament_id, category)`
-**RLS:** Users can only see/insert/update their own picks.
+
+**RLS (Migration 009):**
+
+| Command | Policy | Rule |
+|---------|--------|------|
+| SELECT | `Read own, locked, or admin picks` | `auth.uid() = user_id OR picks_visible(tournament_id, category) OR is_admin()` — other users' picks become visible only once that category (or medal table, or whole tournament) is locked/closed; admins read all (batch scoring runs in the admin browser session) |
+| INSERT | `Insert own picks while open` | `WITH CHECK (auth.uid() = user_id AND picks_open(tournament_id, category))` |
+| UPDATE | `Update own picks while open` | Same expression in `USING` and `WITH CHECK` |
+| DELETE | unchanged | Users delete their own rows |
+
+Helper functions (`SECURITY DEFINER`, `STABLE`, `search_path = public`):
+
+- `is_admin()` — `profiles.role` (enum, compared as upper-case text) = `ADMIN` for `auth.uid()`.
+- `picks_open(t_id bigint, cat text)` — `false` if `tournaments.picks_locked` (or tournament not found); medal table keys (`_medal_table_%`) → `medal_table_status` is NULL or `open`; `_bonuses_` → `false`; weight category → no matching `categories` row has a status other than `open` (names normalized like `weightsMatch` in `lib/rankings.ts`: lower-case, whitespace removed, leading gender prefix `men`/`men's`/`women`/`women's`/`male`/`female` removed, trailing `kg` removed, so `Men -60kg` = `-60 kg` = `-60kg` = `-60`); no matching row → `true`.
+- `picks_visible(t_id bigint, cat text)` — `NOT picks_open(t_id, cat)` (medal table: `medal_table_status` in `locked`/`closed`).
 
 ### `match_results`
 Official match results entered by admin after tournament completes.
@@ -243,11 +311,11 @@ Calculated scores per user/tournament/category (written by scoring engine).
 | `id`            | uuid (PK)   | Auto-generated                          |
 | `user_id`       | uuid (FK)   | → `auth.users.id`                      |
 | `tournament_id` | bigint (FK) | → `tournaments.id`                     |
-| `category`      | text        | Weight class label **or** synthetic `'_medal_table_'` / `'_bonuses_'` |
+| `category`      | text        | Weight class label **or** synthetic `'_medal_table_men_'` / `'_medal_table_women_'` / `'_medal_table_total_'` / `'_bonuses_'` |
 | `total_points`  | integer     | Sum of points earned                    |
 | `correct_picks` | integer     | Contextual (e.g. slots with points for medal table) |
 | `total_picks`   | integer     | Contextual                              |
-| `breakdown`     | jsonb       | `ScoringBreakdown`, `MedalTableScoreBreakdown`, or `TournamentBonusBreakdown` |
+| `breakdown`     | jsonb       | `ScoringBreakdown` (weight categories; includes `goldenLines` for golden-match points), `MedalTableScoreBreakdown`, or `TournamentBonusBreakdown` |
 | `created_at`    | timestamptz | Auto-generated                          |
 
 **Unique:** `(user_id, tournament_id, category)`
@@ -373,6 +441,29 @@ ALTER TABLE public.tournament_scores
   ADD CONSTRAINT tournament_scores_tournament_id_fkey
     FOREIGN KEY (tournament_id) REFERENCES public.tournaments(id) ON DELETE CASCADE;
 ```
+
+### Migration 009 — REQUIRED for v2 (draft autosave, global lock, golden matches, day ranking, Mixed teams, server-enforced pick lock)
+
+**File:** `migrations/009_v2.sql` — idempotent (safe to re-run), wrapped in a single transaction. Run it in Supabase Dashboard → SQL Editor.
+
+**Changes and why:**
+
+| # | Change | Why |
+|---|--------|-----|
+| 1 | `categories.day smallint`; `gender` accepts `Mixed` (any existing gender CHECK is dropped and recreated as `Male`/`Female`/`Mixed`, `NOT VALID`) | Day ranking (points per competition day); mixed team events |
+| 2 | `tournaments.picks_locked boolean NOT NULL DEFAULT false` | Global lock: admin freezes all picks at once |
+| 2 | `tournaments.bracket_draft jsonb`, `bracket_draft_updated_at timestamptz` | Draw-parser draft autosave — unpublished bracket work survives reloads |
+| 2 | `tournaments.golden_matches jsonb NOT NULL DEFAULT '[]'` | Golden matches `[{ category, matchId, points }]`, scored into that category's `tournament_scores.breakdown.goldenLines` |
+| 2 | `tournaments.end_date date` | Multi-day events |
+| 3 | Unique `competition_brackets (tournament_id, weight_category, match_number)` | Draw-parser publish upserts by match. Duplicate rows on that key are deleted first (lowest `id` kept; legacy `actual_results.match_id` references re-pointed to the kept row) |
+| 3 | Ensures unique `user_picks (user_id, tournament_id, category)`, `match_results (tournament_id, category, match_id)`, `tournament_scores (user_id, tournament_id, category)` | App upserts (`onConflict`) rely on them; added only if missing (WARNING and skip if duplicates block it) |
+| 4 | Functions `is_admin()`, `picks_open(bigint, text)`, `picks_visible(bigint, text)` | Shared logic for RLS (see `user_picks` above) |
+| 5 | `user_picks` RLS replaced | **Server-enforced pick lock** (writes rejected once a category / medal table / whole tournament is locked) and **pick visibility after lock** (other players' picks readable only after lock; admin reads all) |
+| 6 | `categories`, `tournaments`, `tournament_scores` added to the `supabase_realtime` publication | Live updates of lock status, tournament state, and scores |
+
+**Policies dropped:** `"Users see own picks"`, `"Authenticated users can read all picks"`, `"authenticated_read_user_picks"`, `"Users insert own picks"`, `"Users update own picks"`. The DELETE policy is unchanged. The script raises a WARNING for any other remaining SELECT/INSERT/UPDATE/ALL policy on `user_picks` (permissive policies are OR-ed and would bypass the lock) — drop those manually.
+
+---
 
 ### Migration 008 — REQUIRED for per-category lock/reopen + medal table status + 3-way medal picks
 
@@ -566,7 +657,11 @@ Tippon/
 ├── vite.config.ts             # Vite config (port 3000, env injection)
 ├── lib/
 │   ├── supabaseClient.ts      # Supabase client init
-│   └── scoringEngine.ts       # Scoring engine: compares picks vs results
+│   ├── scoringEngine.ts       # Scoring engine: compares picks vs results
+│   ├── bracketUtils.ts        # buildMatchesForBracket, simulateBracket, deriveStandings
+│   ├── bracketDraft.ts        # Bracket builder draft model (pure)
+│   ├── drawPdfParser.ts       # Local IJF/EJU draw PDF parser (pdfjs text layer)
+│   └── rankings.ts            # Ranking aggregation, day rankings, weightsMatch
 ├── pages/
 │   ├── Login.tsx              # Auth (login/register)
 │   ├── ForgotPassword.tsx     # Password recovery
@@ -576,7 +671,7 @@ Tippon/
 │   ├── TournamentRoster.tsx   # Player-facing roster view
 │   ├── TournamentBracket.tsx  # Bracket viewer + pick system + result colors
 │   ├── TournamentResults.tsx  # Admin: enter real match winners
-│   ├── BuildBracket.tsx       # Admin: PDF → bracket extraction (Gemini)
+│   ├── BuildBracket.tsx       # Admin: draw PDF import (local parser, Gemini fallback) + draft editor + publish
 │   ├── BracketBuilder.tsx     # Admin: manual bracket builder
 │   ├── Leaderboard.tsx        # Global + per-tournament rankings
 │   └── Profile.tsx            # User profile
@@ -585,19 +680,25 @@ Tippon/
 │   ├── MatchCard.tsx          # Single match display
 │   ├── TournamentRoster.tsx   # Admin roster management (import Excel)
 │   ├── FlatFlag.tsx           # Country flag component
+│   ├── MobileBracketTabs.tsx  # Phone bracket: round tabs
+│   ├── BracketZoom.tsx        # Zoomable bracket tree (desktop/tablet)
+│   ├── UserPicksViewer.tsx    # Read-only picks of another user (RLS-visible)
+│   ├── bracketBuilder/        # DrawImportPanel, BracketEditor, PoolGrid, UnassignedTray, useDraftAutosave, aiDrawExtraction
 │   └── ui/
 │       ├── Button.tsx         # Reusable button
 │       └── Flag.tsx           # Flag wrapper
+├── migrations/009_v2.sql      # v2 schema, picks_open()/picks_visible(), user_picks RLS
+├── tests/                     # vitest suites
 ├── vercel.json                # SPA rewrites for Vercel
 └── .env.local                 # GEMINI_API_KEY + Supabase creds (not committed)
 ```
 
 ## AI Integration (Gemini)
 
-- **Model:** `gemini-2.5-flash-lite` (low latency, high availability)
+- **Model:** `gemini-2.5-flash-lite` for results PDFs; `gemini-2.5-flash` for the scanned-draw fallback (`components/bracketBuilder/aiDrawExtraction.ts`)
 - **SDK:** `@google/genai` v1.48+
 - **Usage:**
-  - PDF draw extraction in `BuildBracket.tsx` — extracts Round 1 matchups from the IJF Draw PDF
+  - Draw PDFs are parsed locally (`lib/drawPdfParser.ts`); Gemini is only used for draw pages without a text layer (scanned PDFs), output marked `source: 'ai'` for review
   - PDF results extraction in `TournamentResults.tsx` — extracts all-round winners from the JudoTV/IJF Results PDF
 - **Config:** thinking disabled (`thinkingBudget: 0`), JSON structured output via `responseJsonSchema`
 - **Timeout:** 120 seconds via `httpOptions`
@@ -629,7 +730,8 @@ Tippon/
 - `scoring_configuration` from admin is not consumed by `scoringEngine.ts` — engine uses default round-based points (`R1=2, R2=4, QF=8, SF=16, F=32`)
 - Roster re-import can duplicate athletes if no DB unique constraint exists on `(tournament_id, first_name, last_name)`
 - `BuildBracket.tsx` preview mode (`showPreview`) is defined but never triggered (dead code)
-- No server-side enforcement of pick lockout — only UI-level; direct Supabase writes could bypass lock
+- Medal table picks are 3 slots × 3 keys (`_medal_table_men_`, `_medal_table_women_`, `_medal_table_total_`); legacy `_medal_table_` rows were renamed to `_medal_table_total_` in Migration 008
+- Pick lockout is enforced server-side (RLS + `picks_open()`) only once Migration 009 is applied
 
 ## Feature Updates (Major Features)
 

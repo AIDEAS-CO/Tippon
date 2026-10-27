@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { Match, Competitor } from '../types';
 import Flag from './ui/Flag';
-import { CheckCircle, GripVertical } from 'lucide-react';
+import { CheckCircle, GripVertical, Star } from 'lucide-react';
 
 type ResultStatus = 'correct' | 'incorrect' | null;
 
@@ -16,6 +16,12 @@ interface MatchCardProps {
   onDropCompetitor?: (matchId: string, slot: 'competitor1' | 'competitor2', competitor: Competitor) => void;
   resultStatus?: ResultStatus;
   actualWinnerId?: string;
+  /** Stretch to container width (mobile list view) instead of the fixed tree width. */
+  fullWidth?: boolean;
+  isGolden?: boolean;
+  goldenPoints?: number;
+  /** Admin only: toggles Golden Match status for this match. */
+  onToggleGolden?: (matchId: string) => void;
 }
 
 const MatchCard: React.FC<MatchCardProps> = ({ 
@@ -28,6 +34,10 @@ const MatchCard: React.FC<MatchCardProps> = ({
   onDropCompetitor,
   resultStatus = null,
   actualWinnerId,
+  fullWidth = false,
+  isGolden = false,
+  goldenPoints,
+  onToggleGolden,
 }) => {
   const [dragOverSlot, setDragOverSlot] = useState<'top' | 'bottom' | null>(null);
 
@@ -115,7 +125,7 @@ const MatchCard: React.FC<MatchCardProps> = ({
         onClick={() => !isLocked && onPick(match.id, competitor.id)}
         className={`flex items-center justify-between p-3 h-12 cursor-pointer transition-colors ${isTop ? 'border-b border-slate-200' : ''} ${borderClass}`}
       >
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 min-w-0">
           {canDrag && (
             <div className="text-slate-300 hover:text-slate-500 cursor-grab active:cursor-grabbing mr-[-4px]">
                <GripVertical size={14} />
@@ -125,7 +135,7 @@ const MatchCard: React.FC<MatchCardProps> = ({
             <span className="text-xs text-slate-400 w-8 font-medium shrink-0">({competitor.rank})</span>
           )}
           <Flag countryCode={competitor.country} className="w-5 h-3.5 shadow-sm" />
-          <span className="text-sm font-semibold text-slate-800 truncate max-w-[120px]">
+          <span className={`text-sm font-semibold text-slate-800 truncate ${fullWidth ? 'max-w-[55vw]' : 'max-w-[120px]'}`}>
             {competitor.name}
           </span>
           <span className="text-xs text-slate-500 font-bold">{competitor.country}</span>
@@ -144,7 +154,10 @@ const MatchCard: React.FC<MatchCardProps> = ({
     ? 'border-emerald-400'
     : resultStatus === 'incorrect'
     ? 'border-red-300'
+    : isGolden
+    ? 'border-amber-400'
     : 'border-slate-300';
+  const goldenClass = isGolden ? 'ring-2 ring-amber-300 shadow-[0_0_14px_rgba(245,158,11,0.45)]' : '';
 
   const headerBgClass = resultStatus === 'correct'
     ? 'bg-emerald-50'
@@ -153,10 +166,27 @@ const MatchCard: React.FC<MatchCardProps> = ({
     : 'bg-slate-50';
 
   return (
-    <div className={`flex flex-col w-72 bg-white border ${cardBorderClass} rounded-lg shadow-sm overflow-hidden z-10 relative`}>
-      <div className={`flex justify-between items-center px-3 py-1.5 ${headerBgClass} border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider`}>
-        <span className={resultStatus === 'correct' ? 'text-emerald-600' : resultStatus === 'incorrect' ? 'text-red-500' : 'text-blue-600'}>
+    <div className={`flex flex-col ${fullWidth ? 'w-full' : 'w-72'} bg-white border ${cardBorderClass} ${goldenClass} rounded-lg shadow-sm overflow-hidden z-10 relative`}>
+      {isGolden && (
+        <div className="flex items-center gap-1 px-3 py-1 bg-gradient-to-r from-amber-100 to-yellow-50 border-b border-amber-200 text-[10px] font-black text-amber-700 uppercase tracking-wider">
+          <Star size={11} className="fill-amber-400 text-amber-500" />
+          Golden Match{goldenPoints != null ? ` · +${goldenPoints} pts` : ''}
+        </div>
+      )}
+      <div className={`flex justify-between items-center gap-2 px-3 py-1.5 ${headerBgClass} border-b border-slate-200 text-[10px] font-bold text-slate-500 uppercase tracking-wider`}>
+        <span className={`flex items-center gap-1.5 ${resultStatus === 'correct' ? 'text-emerald-600' : resultStatus === 'incorrect' ? 'text-red-500' : 'text-blue-600'}`}>
           Match {match.matchNumber}
+          {onToggleGolden && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onToggleGolden(match.id); }}
+              className={`p-0.5 rounded hover:bg-amber-100 transition-colors ${isGolden ? 'text-amber-500' : 'text-slate-300 hover:text-amber-500'}`}
+              title={isGolden ? 'Remove Golden Match' : 'Mark as Golden Match'}
+              aria-label={isGolden ? 'Remove Golden Match' : 'Mark as Golden Match'}
+            >
+              <Star size={12} className={isGolden ? 'fill-amber-400' : ''} />
+            </button>
+          )}
         </span>
         {match.round === 'SF' ? (
           <span className="text-slate-500">Semi</span>

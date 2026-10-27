@@ -8,6 +8,7 @@ import { supabase } from '../lib/supabaseClient';
 import { ViewState, Tournament, UserProfile } from '../types';
 import Button from '../components/ui/Button';
 import Flag from '../components/ui/Flag';
+import { aggregateRanking, buildDayRankings, rankOf, selectStandingTournament } from '../lib/rankings';
 
 interface HomeProps {
     onNavigate: (view: ViewState) => void;
@@ -21,6 +22,15 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
   const [loading, setLoading] = useState(true);
   /** Sum of tournament_scores — source of truth (profiles.points can be stale after tournament deletes) */
   const [seasonPointsLive, setSeasonPointsLive] = useState<number | null>(null);
+  /** Global rank computed from all tournament_scores (ties share rank). */
+  const [globalRank, setGlobalRank] = useState<{ rank: number; of: number } | null>(null);
+  /** Standing in the current/most recent LIVE or COMPLETED tournament the user played. */
+  const [standing, setStanding] = useState<{
+    tournament: Tournament;
+    total: { rank: number; of: number } | null;
+    day: number | null;
+    dayRank: { rank: number; of: number } | null;
+  } | null>(null);
   
   // Use global prop for source of truth with robust fallbacks
   const userName = userProfile?.username || userProfile?.full_name?.split(' ')[0] || 'Judoka';
@@ -100,16 +110,38 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
     (async () => {
       const { data, error } = await supabase
         .from('tournament_scores')
-        .select('total_points')
-        .eq('user_id', uid);
+        .select('user_id, tournament_id, category, total_points');
       if (error) {
         setSeasonPointsLive(userProfile?.points ?? 0);
         return;
       }
-      const sum = (data || []).reduce((acc, row) => acc + (row.total_points || 0), 0);
+      const rows = data || [];
+      const mine = rows.filter((r: any) => r.user_id === uid);
+      const sum = mine.reduce((acc, row: any) => acc + (row.total_points || 0), 0);
       setSeasonPointsLive(sum);
+      setGlobalRank(rankOf(aggregateRanking(rows), uid));
+
+      // Tournament standing (Total + latest day)
+      const participated = new Set(mine.map((r: any) => String(r.tournament_id)));
+      const t = selectStandingTournament(tournaments, participated);
+      if (!t) {
+        setStanding(null);
+        return;
+      }
+      const { data: cats } = await supabase
+        .from('categories')
+        .select('name, day')
+        .eq('tournament_id', t.id);
+      const tRows = rows.filter((r: any) => String(r.tournament_id) === String(t.id));
+      const dr = buildDayRankings(tRows, cats || []);
+      setStanding({
+        tournament: t,
+        total: rankOf(dr.total, uid),
+        day: dr.latestDay,
+        dayRank: dr.latestDay !== null ? rankOf(dr.byDay[dr.latestDay], uid) : null,
+      });
     })();
-  }, [userProfile?.id, userProfile?.points]);
+  }, [userProfile?.id, userProfile?.points, tournaments]);
 
   const handleManagePredictions = () => {
     if (heroTournament) {
@@ -190,8 +222,8 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
           <StatCard 
              label="Global Rank" 
-             value={userProfile?.rank ? `#${userProfile.rank}` : '-'} 
-             subValue="Global" 
+             value={globalRank ? `#${globalRank.rank}` : '-'} 
+             subValue={globalRank ? `of ${globalRank.of} players` : 'Global'} 
              icon={Trophy} 
              color="text-amber-500" 
              bg="bg-amber-50" 
@@ -212,10 +244,40 @@ const Home: React.FC<HomeProps> = ({ onNavigate, onSelectTournament, userProfile
              subValue="Total accumulated" 
              icon={Zap} 
              color="text-purple-600" 
-             bg="bg-purple-50" 
+             bg="bg-purple-50"
              delay="delay-200"
           />
        </div>
+
+       {/* Tournament standing (current / most recent LIVE or COMPLETED tournament) */}
+       {standing && (
+         <button
+           onClick={() => onSelectTournament(standing.tournament)}
+           className="w-full text-left bg-white p-5 rounded-2xl shadow-zen border border-slate-100 flex flex-wrap items-center justify-between gap-4 hover:border-blue-600/20 transition-all"
+         >
+           <div className="min-w-0">
+             <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">
+               {standing.tournament.status?.toUpperCase() === 'LIVE' ? 'Live tournament' : 'Last tournament'}
+             </p>
+             <h3 className="text-lg font-black text-slate-900 truncate">{standing.tournament.name}</h3>
+           </div>
+           <div className="flex gap-6">
+             <div>
+               <p className="text-[10px] font-bold text-slate-400 uppercase">Total</p>
+               <p className="text-xl font-black text-slate-900">
+                 {standing.total ? `#${standing.total.rank}` : '-'}
+                 {standing.total && <span className="text-xs font-bold text-slate-400"> of {standing.total.of}</span>}
+               </p>
+             </div>
+             {standing.day !== null && (
+               <div>
+                 <p className="text-[10px] font-bold text-slate-400 uppercase">Day {standing.day}</p>
+                 <p className="text-xl font-black text-primary">{standing.dayRank ? `#${standing.dayRank.rank}` : '-'}</p>
+               </div>
+             )}
+           </div>
+         </button>
+       )}
 
        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           

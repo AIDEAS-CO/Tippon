@@ -1,20 +1,62 @@
 
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   ViewState,
   Tournament,
   ScoringBreakdown,
   TournamentBonusBreakdown,
   MedalTableScoreBreakdown,
+  GoldenMatchScoreLine,
+  PositionScoreDetail,
 } from '../types';
-import { 
-  ChevronUp, ChevronDown, Minus, 
+import {
+  ChevronUp, ChevronDown, Minus,
   Search, X, Trophy, TrendingUp, Star, History, Target, Loader2, ArrowLeft, Globe, BarChart3,
-  CheckCircle2, XCircle
+  CheckCircle2, XCircle, Eye, FastForward
 } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
 import { calculateMyScore } from '../lib/scoringEngine';
+import { buildDayRankings, dayOfCategory, aggregateRanking, CategoryDay } from '../lib/rankings';
+import UserPicksViewer from '../components/UserPicksViewer';
+
+/** Rank-step deviation label (positions 1→2→3→5→7). */
+export const deviationLabel = (d: PositionScoreDetail): string =>
+  d.actual == null || d.deviation >= 99
+    ? 'no placement'
+    : d.deviation === 0
+      ? 'exact'
+      : `${d.deviation} step${d.deviation === 1 ? '' : 's'} off`;
+
+/** ★ Golden match lines for a category breakdown. */
+export const GoldenLinesList: React.FC<{ lines?: GoldenMatchScoreLine[] }> = ({ lines }) => {
+  if (!lines || lines.length === 0) return null;
+  return (
+    <div className="pt-1 border-t border-slate-100">
+      <p className="font-black text-amber-600 uppercase tracking-wider text-[10px] mb-1">Golden matches</p>
+      <ul className="space-y-1">
+        {lines.map((g) => (
+          <li key={g.matchId} className="flex justify-between gap-2 text-[11px]">
+            <span className="text-slate-700 truncate">
+              <span className="text-amber-500">★</span> {g.label || g.round || 'Golden Match'}:{' '}
+              <span className="text-slate-500">
+                picked {g.pickedName || g.pickedId || '—'}, winner {g.winnerName || g.winnerId || 'TBD'}
+              </span>
+            </span>
+            <span className={`font-black flex-shrink-0 ${g.points > 0 ? 'text-amber-600' : 'text-slate-300'}`}>
+              +{g.points} pts
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+type DayTab = 'total' | number;
+
+/** Delay between revealed rows (ms), last place first. */
+const REVEAL_STEP_MS = 400;
 
 interface LeaderboardProps {
   onNavigate: (view: ViewState) => void;
@@ -48,7 +90,19 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
   const [loadingBreakdown, setLoadingBreakdown] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [viewMode, setViewMode] = useState<'global' | 'tournament'>(tournament ? 'tournament' : 'global');
-  
+
+  // Tournament view: raw score rows + category days, ranked client-side per tab
+  const [tScoreRows, setTScoreRows] = useState<any[]>([]);
+  const [tCategoryDays, setTCategoryDays] = useState<CategoryDay[]>([]);
+  const [tProfiles, setTProfiles] = useState<Map<string, any>>(new Map());
+  const [meId, setMeId] = useState<string | undefined>(undefined);
+  const [dayTab, setDayTab] = useState<DayTab>('total');
+  const defaultTabSetFor = useRef<string | null>(null);
+  const [modalTab, setModalTab] = useState<'breakdown' | 'picks'>('breakdown');
+
+  // Reveal animation: number of rows shown from the bottom; null = everything visible
+  const [revealCount, setRevealCount] = useState<number | null>(null);
+
   useEffect(() => {
     if (tournament) setViewMode('tournament');
   }, [tournament]);
@@ -61,34 +115,57 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
     }
   }, [viewMode, tournament?.id]);
 
-  const fetchTournamentLeaderboard = async () => {
+  // Live refresh: window focus + realtime changes on tournament_scores
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const refresh = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (viewMode === 'tournament' && tournament?.id) fetchTournamentLeaderboard(true);
+        else fetchGlobalLeaderboard(true);
+      }, 800);
+    };
+    window.addEventListener('focus', refresh);
+    const channel = supabase
+      .channel(`leaderboard-${viewMode}-${tournament?.id ?? 'global'}-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        viewMode === 'tournament' && tournament?.id
+          ? { event: '*', schema: 'public', table: 'tournament_scores', filter: `tournament_id=eq.${tournament.id}` }
+          : { event: '*', schema: 'public', table: 'tournament_scores' },
+        refresh
+      )
+      .subscribe();
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener('focus', refresh);
+      supabase.removeChannel(channel);
+    };
+  }, [viewMode, tournament?.id]);
+
+  const fetchTournamentLeaderboard = async (silent = false, selfScored = false) => {
     if (!tournament?.id) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       const currentUserId = user?.id;
+      setMeId(currentUserId);
 
-      const { data: scores, error } = await supabase
-        .from('tournament_scores')
-        .select('user_id, total_points, correct_picks, total_picks')
-        .eq('tournament_id', tournament.id);
+      const [{ data: scores, error }, { data: cats }] = await Promise.all([
+        supabase
+          .from('tournament_scores')
+          .select('user_id, category, total_points, correct_picks, total_picks')
+          .eq('tournament_id', tournament.id),
+        supabase.from('categories').select('name, day').eq('tournament_id', tournament.id),
+      ]);
 
       if (error && error.code !== '42P01') throw error;
 
-      // Aggregate scores across categories per user
-      const userScoreMap = new Map<string, { total_points: number; correct_picks: number; total_picks: number }>();
-      (scores || []).forEach((s: any) => {
-        const existing = userScoreMap.get(s.user_id) || { total_points: 0, correct_picks: 0, total_picks: 0 };
-        existing.total_points += s.total_points || 0;
-        existing.correct_picks += s.correct_picks || 0;
-        existing.total_picks += s.total_picks || 0;
-        userScoreMap.set(s.user_id, existing);
-      });
-
-      const userIds = Array.from(userScoreMap.keys());
+      const rows = scores || [];
+      const userIds = Array.from(new Set(rows.map((s: any) => s.user_id as string)));
       if (userIds.length === 0) {
-        // Fallback: trigger self-score calculation for current user so at least they appear
-        if (currentUserId) {
+        // Fallback: trigger self-score calculation for current user so at least they appear (once)
+        if (currentUserId && !selfScored) {
           const { data: myPicks } = await supabase
             .from('user_picks')
             .select('category, picks_data')
@@ -97,17 +174,16 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
           if (myPicks && myPicks.length > 0) {
             await Promise.all(
               myPicks.map((p: any) =>
-                calculateMyScore(tournament.id, p.category, currentUserId, p.picks_data)
+                calculateMyScore(tournament.id, p.category, currentUserId, p.picks_data, tournament.goldenMatches)
               )
             );
             // Retry fetch after self-scoring
-            fetchTournamentLeaderboard();
+            await fetchTournamentLeaderboard(silent, true);
             return;
           }
         }
-        setLeaderboardData([]);
-        setCurrentUserData(null);
-        setLoading(false);
+        setTScoreRows([]);
+        setTCategoryDays((cats || []) as CategoryDay[]);
         return;
       }
 
@@ -119,41 +195,78 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
       const profileMap = new Map<string, any>();
       (profiles || []).forEach((p: any) => profileMap.set(p.id, p));
 
-      const sorted = Array.from(userScoreMap.entries())
-        .sort((a, b) => b[1].total_points - a[1].total_points);
+      const categoryDays = (cats || []) as CategoryDay[];
+      setTProfiles(profileMap);
+      setTCategoryDays(categoryDays);
+      setTScoreRows(rows);
 
-      const mappedData: LeaderboardUser[] = sorted.map(([userId, score], index) => {
-        const profile = profileMap.get(userId);
-        const name = profile?.full_name || 'Anonymous Judoka';
-        const isMe = userId === currentUserId;
-        const accuracy = score.total_picks > 0
-          ? Math.round((score.correct_picks / score.total_picks) * 100)
-          : 0;
-
-        return {
-          id: userId,
-          rank: index + 1,
-          previousRank: index + 1,
-          name,
-          username: profile?.username || 'user',
-          points: score.total_points,
-          accuracy,
-          avatar: profile?.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff`,
-          isMe,
-          perfectBrackets: 0,
-          streak: [],
-          countryCode: 'JP',
-        };
-      });
-
-      setLeaderboardData(mappedData);
-      setCurrentUserData(mappedData.find((u) => u.isMe) || null);
+      // Default tab: latest competition day with scores (only on first load of this tournament)
+      if (defaultTabSetFor.current !== tournament.id) {
+        defaultTabSetFor.current = tournament.id;
+        const { latestDay } = buildDayRankings(rows, categoryDays);
+        setDayTab(latestDay ?? 'total');
+      }
     } catch (err) {
       console.error('Error fetching tournament leaderboard:', err);
     } finally {
       setLoading(false);
     }
   };
+
+  const dayRankings = useMemo(() => buildDayRankings(tScoreRows, tCategoryDays), [tScoreRows, tCategoryDays]);
+  const dayTabs = useMemo(
+    () => Object.keys(dayRankings.byDay).map(Number).sort((a, b) => a - b),
+    [dayRankings]
+  );
+
+  // Tournament rows for the active tab (ties share rank)
+  const tournamentData: LeaderboardUser[] = useMemo(() => {
+    const ranking = dayTab === 'total' ? dayRankings.total : dayRankings.byDay[dayTab] || [];
+    const acc = new Map<string, { c: number; t: number }>();
+    for (const r of tScoreRows) {
+      if (dayTab !== 'total' && dayOfCategory(r.category, tCategoryDays) !== dayTab) continue;
+      const a = acc.get(r.user_id) || { c: 0, t: 0 };
+      a.c += r.correct_picks || 0;
+      a.t += r.total_picks || 0;
+      acc.set(r.user_id, a);
+    }
+    return ranking.map((r) => {
+      const profile = tProfiles.get(r.userId);
+      const name = profile?.full_name || 'Anonymous Judoka';
+      const a = acc.get(r.userId);
+      return {
+        id: r.userId,
+        rank: r.rank,
+        previousRank: r.rank,
+        name,
+        username: profile?.username || 'user',
+        points: r.points,
+        accuracy: a && a.t > 0 ? Math.round((a.c / a.t) * 100) : 0,
+        avatar: profile?.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff`,
+        isMe: r.userId === meId,
+        perfectBrackets: 0,
+        streak: [],
+        countryCode: 'JP',
+      };
+    });
+  }, [dayTab, dayRankings, tScoreRows, tCategoryDays, tProfiles, meId]);
+
+  const isTournamentView = viewMode === 'tournament' && !!tournament;
+  const boardData = isTournamentView ? tournamentData : leaderboardData;
+
+  // Reveal ticker: one more row every REVEAL_STEP_MS until all are visible
+  useEffect(() => {
+    if (revealCount === null) return;
+    if (revealCount >= boardData.length) {
+      const t = setTimeout(() => setRevealCount(null), REVEAL_STEP_MS);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => setRevealCount((c) => (c === null ? null : c + 1)), REVEAL_STEP_MS);
+    return () => clearTimeout(t);
+  }, [revealCount, boardData.length]);
+
+  // Cancel reveal when switching view or tab
+  useEffect(() => { setRevealCount(null); }, [viewMode, dayTab]);
 
   const ROUND_LABELS: Record<string, string> = {
     R1: 'Round 1', R2: 'Round 2', R3: 'Round 3',
@@ -185,6 +298,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
   const handleSelectUser = async (user: LeaderboardUser) => {
     setSelectedUser(user);
     setSelectedUserBreakdown(null);
+    setModalTab('breakdown');
     if (viewMode === 'tournament' && tournament?.id) {
       setLoadingBreakdown(true);
       try {
@@ -203,8 +317,8 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
     }
   };
 
-  const fetchGlobalLeaderboard = async () => {
-    setLoading(true);
+  const fetchGlobalLeaderboard = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       const currentUserId = user?.id;
@@ -213,17 +327,15 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
       // immediately reflects a lower (or zero) score without stale profile data.
       const { data: allScores } = await supabase
         .from('tournament_scores')
-        .select('user_id, total_points');
+        .select('user_id, category, total_points');
 
-      const userTotals = new Map<string, number>();
-      for (const s of allScores || []) {
-        userTotals.set(s.user_id, (userTotals.get(s.user_id) || 0) + (s.total_points || 0));
-      }
+      // Ties share a rank (1, 1, 3)
+      const ranking = aggregateRanking(allScores || []);
+      const userTotals = new Map<string, number>(ranking.map(r => [r.userId, r.points]));
+      const rankOf = new Map<string, number>(ranking.map(r => [r.userId, r.rank]));
 
-      // Sort and take top 100
-      const sorted = Array.from(userTotals.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 100);
+      // Take top 100
+      const sorted = ranking.slice(0, 100).map(r => [r.userId, r.points] as [string, number]);
 
       if (sorted.length === 0) {
         setLeaderboardData([]);
@@ -256,7 +368,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
 
       const mappedData: LeaderboardUser[] = sorted.map(([uid, totalPoints], index) => {
         const profile = profileMap.get(uid);
-        const rank = index + 1;
+        const rank = rankOf.get(uid) ?? index + 1;
         const name = profile?.full_name || 'Anonymous Judoka';
         const isMe = uid === currentUserId;
         return {
@@ -282,7 +394,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
         setCurrentUserData(meInTop);
       } else if (currentUserId) {
         const myTotal = userTotals.get(currentUserId) || 0;
-        const myRank = Array.from(userTotals.values()).filter(p => p > myTotal).length + 1;
+        const myRank = rankOf.get(currentUserId) ?? Array.from(userTotals.values()).filter(p => p > myTotal).length + 1;
         const { data: myProfile } = await supabase
           .from('profiles')
           .select('id, full_name, username, avatar_url')
@@ -304,20 +416,21 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
   };
 
   // Filter logic: Search by name OR username
-  const filteredData = leaderboardData.filter(user => 
-    user.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
+  const isRevealing = revealCount !== null;
+  const filteredData = isRevealing ? boardData : boardData.filter(user =>
+    user.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
     user.username.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  // Logic for "My Rank" Bar - Usamos currentUserData en lugar de buscar en el array
-  const myUser = currentUserData;
-  
-  // To calculate who to overtake, check the global array if rank is close,
-  // or if outside top 100, don't show a specific rival.
-  const userAbove = myUser && myUser.rank > 1 
-      ? leaderboardData.find(u => u.rank === myUser.rank - 1) 
+  // "My Rank" bar: tournament view derives it from the active tab
+  const myUser = isTournamentView ? (tournamentData.find(u => u.isMe) || null) : currentUserData;
+
+  // Closest user with more points (ties share a rank, so look by points, not rank - 1).
+  // Outside the top 100 in global view, no specific rival is shown.
+  const userAbove = myUser && myUser.rank > 1
+      ? [...boardData].reverse().find(u => u.points > myUser.points) || null
       : null;
-      
+
   const pointsToOvertake = myUser && userAbove ? userAbove.points - myUser.points + 1 : 0;
 
   const getRankChangeIcon = (current: number, prev: number) => {
@@ -327,9 +440,11 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
       return <div className="text-slate-300"><Minus size={12} /></div>;
   };
 
-  const top3 = leaderboardData.slice(0, 3);
-  const showPodium = searchQuery === '' && top3.length >= 3;
-  const listToRender = showPodium ? leaderboardData.slice(3) : filteredData;
+  const top3 = boardData.slice(0, 3);
+  const showPodium = !isRevealing && searchQuery === '' && top3.length >= 3;
+  const listToRender = showPodium ? boardData.slice(3) : filteredData;
+  /** During reveal, row i (0 = 1st) is visible once the last `revealCount` rows are shown. */
+  const isRowHidden = (index: number) => isRevealing && index < boardData.length - (revealCount as number);
 
   if (loading) {
       return (
@@ -379,6 +494,40 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                    <Globe size={14} />
                    Global
                  </button>
+               </div>
+             )}
+             {isTournamentView && (
+               <div className="flex flex-wrap items-center gap-2 mt-3">
+                 <div className="flex bg-slate-100 rounded-lg p-1 w-fit max-w-full overflow-x-auto">
+                   {(['total', ...dayTabs] as DayTab[]).map(tab => (
+                     <button
+                       key={String(tab)}
+                       onClick={() => setDayTab(tab)}
+                       className={`px-3 py-1.5 rounded-md text-sm font-bold transition-colors whitespace-nowrap ${
+                         dayTab === tab ? 'bg-white text-primary shadow-sm' : 'text-slate-500 hover:text-slate-700'
+                       }`}
+                     >
+                       {tab === 'total' ? 'Total' : `Day ${tab}`}
+                     </button>
+                   ))}
+                 </div>
+                 {boardData.length > 0 && (
+                   isRevealing ? (
+                     <button
+                       onClick={() => setRevealCount(null)}
+                       className="px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 bg-slate-900 text-white hover:bg-slate-800"
+                     >
+                       <FastForward size={14} /> Skip
+                     </button>
+                   ) : (
+                     <button
+                       onClick={() => { setSearchQuery(''); setRevealCount(0); }}
+                       className="px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1.5 bg-primary text-white hover:opacity-90"
+                     >
+                       <Eye size={14} /> Reveal
+                     </button>
+                   )
+                 )}
                </div>
              )}
          </div>
@@ -484,11 +633,20 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
         {/* List Section - Compact */}
         <div className="max-w-4xl mx-auto space-y-3 pb-24">
             {listToRender.length > 0 ? (
-                listToRender.map((user, index) => (
-                    <div 
+                listToRender.map((user, index) => isRowHidden(index) ? (
+                    <div
+                        key={user.id}
+                        className="flex items-center p-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50/60"
+                    >
+                        <div className="w-8 font-black text-slate-300 text-sm text-center">?</div>
+                        <div className="size-10 rounded-full bg-slate-200/70 mr-4" />
+                        <div className="flex-1 h-3 rounded bg-slate-200/70 max-w-[10rem]" />
+                    </div>
+                ) : (
+                    <div
                         key={user.id}
                         onClick={() => handleSelectUser(user)}
-                        style={{ animationDelay: `${index * 50 + 150}ms` }}
+                        style={{ animationDelay: isRevealing ? '0ms' : `${index * 50 + 150}ms` }}
                         className={`flex items-center p-4 rounded-2xl border bg-white shadow-sm transition-all active:scale-[0.99] cursor-pointer opacity-0 animate-fade-in-up
                             ${user.isMe ? 'border-primary/50 bg-blue-50/30' : 'border-slate-100 hover:border-slate-300'}
                         `}
@@ -558,7 +716,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                 </div>
             </div>
             <button 
-                onClick={() => setSelectedUser(myUser)}
+                onClick={() => handleSelectUser(myUser)}
                 className="size-10 flex items-center justify-center bg-slate-700 hover:bg-slate-600 rounded-full border border-slate-600 transition-colors"
             >
                 <ChevronUp size={20} />
@@ -629,7 +787,34 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                   </div>
 
                   {/* Score breakdown — only in tournament mode */}
-                  {viewMode === 'tournament' && (
+                  {isTournamentView && (
+                    <div className="px-6 mb-3">
+                      <div className="flex bg-slate-100 rounded-lg p-1">
+                        {(['breakdown', 'picks'] as const).map(t => (
+                          <button
+                            key={t}
+                            onClick={() => setModalTab(t)}
+                            className={`flex-1 px-3 py-1.5 rounded-md text-xs font-bold transition-colors ${
+                              modalTab === t ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+                            }`}
+                          >
+                            {t === 'breakdown' ? 'Breakdown' : 'Picks'}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {isTournamentView && modalTab === 'picks' && (
+                    <div className="px-6">
+                      <UserPicksViewer
+                        tournamentId={tournament!.id}
+                        userId={selectedUser.id}
+                        hasRepechage={!!tournament?.scoring_configuration?.has_repechage}
+                        picksLocked={!!tournament?.picksLocked}
+                      />
+                    </div>
+                  )}
+                  {viewMode === 'tournament' && modalTab === 'breakdown' && (
                     <div className="px-6">
                       {loadingBreakdown ? (
                         <div className="flex items-center justify-center gap-2 py-4 text-slate-400">
@@ -788,7 +973,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                                                 {d.competitorName || d.competitorId}
                                                 <span className="text-slate-400 font-normal">
                                                   {' '}
-                                                  pred {d.predicted}° → act {d.actual ?? '—'} (Δ{d.deviation})
+                                                  pred {d.predicted}° → act {d.actual ?? '—'} ({deviationLabel(d)})
                                                 </span>
                                               </span>
                                               <span className="text-green-600 font-black flex-shrink-0">{d.points} pts</span>
@@ -809,7 +994,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                                                 {d.competitorName || d.competitorId}
                                                 <span className="text-slate-400 font-normal">
                                                   {' '}
-                                                  pred {d.predicted}° → act {d.actual ?? '—'} (Δ{d.deviation})
+                                                  pred {d.predicted}° → act {d.actual ?? '—'} ({deviationLabel(d)})
                                                 </span>
                                               </span>
                                               <span className="text-green-600 font-black flex-shrink-0">{d.points} pts</span>
@@ -850,6 +1035,7 @@ const Leaderboard: React.FC<LeaderboardProps> = ({ userStats, tournament, onNavi
                                           : ''}
                                       </p>
                                     </div>
+                                    <GoldenLinesList lines={b.goldenLines} />
                                     <div className="flex justify-between items-center border-t border-slate-200 pt-2">
                                       <span className="font-black text-slate-600">Category total</span>
                                       <span className="font-black text-primary">{b.categoryTotal} pts</span>

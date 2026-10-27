@@ -12,6 +12,9 @@ import { buildMatchesForBracket, deriveStandings } from '../lib/bracketUtils';
 import { computeCountryMedalRanking, type CountryMedalRow } from '../lib/countryMedalRanking';
 import { MEDAL_TABLE_MEN, MEDAL_TABLE_WOMEN, MEDAL_TABLE_TOTAL } from '../lib/tournamentConstants';
 import Flag from '../components/ui/Flag';
+import UserPicksViewer from '../components/UserPicksViewer';
+import { GoldenLinesList, deviationLabel } from './Leaderboard';
+import { lookupByWeight } from '../lib/rankings';
 import { ArrowLeft, Loader2, ChevronDown, Trophy } from 'lucide-react';
 
 interface TournamentFinalResultsProps {
@@ -71,6 +74,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
     { userId: string; total: number; name: string; username: string }[]
   >([]);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState<'breakdown' | 'picks'>('breakdown');
   const [userScoreRows, setUserScoreRows] = useState<any[] | null>(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [mainTab, setMainTab] = useState<'standings' | 'medalCountry'>('standings');
@@ -93,9 +97,10 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
 
   const filteredCountryMedalRows = useMemo(() => {
     if (!rawMedalData) return countryMedalRows;
+    // Only exact 'Male'/'Female' count for Men/Women; Mixed and unknown appear in Total only
     const targetGender = medalGenderTab === 'Men' ? 'Male' : medalGenderTab === 'Women' ? 'Female' : null;
     const filteredCats = targetGender
-      ? categories.filter((c) => categoryGenderMap.get(c) === targetGender)
+      ? categories.filter((c) => lookupByWeight(categoryGenderMap, c) === targetGender)
       : categories;
     if (filteredCats.length === 0) return [];
     return computeCountryMedalRanking(
@@ -632,8 +637,29 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
         {selectedUserId && userScoreRows && (
           <section>
             <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3">
-              Score breakdown — {leaderRows.find((x) => x.userId === selectedUserId)?.name || 'Player'}
+              Player detail — {leaderRows.find((x) => x.userId === selectedUserId)?.name || 'Player'}
             </h2>
+            <div className="flex bg-slate-100 rounded-lg p-1 mb-3 w-fit">
+              {(['breakdown', 'picks'] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setDetailTab(t)}
+                  className={`px-4 py-1.5 rounded-md text-xs font-bold transition-colors ${
+                    detailTab === t ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+                  }`}
+                >
+                  {t === 'breakdown' ? 'Score breakdown' : 'Picks'}
+                </button>
+              ))}
+            </div>
+            {detailTab === 'picks' && tournament?.id ? (
+              <UserPicksViewer
+                tournamentId={tournament.id}
+                userId={selectedUserId}
+                hasRepechage={!!(tournament as any)?.scoring_configuration?.has_repechage}
+                picksLocked={!!tournament.picksLocked}
+              />
+            ) : (<>
             {verifiedBreakdownSum !== null && leaderTotalForSelected !== null && (
               <div
                 className={`mb-3 rounded-xl border px-3 py-2 text-[11px] font-bold ${
@@ -737,7 +763,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
                         {b.goldSilver.map((d) => (
                           <div key={`gs-${d.competitorId}`} className="flex justify-between">
                             <span className="text-slate-700">
-                              G/S: {d.competitorName} — pred {d.predicted}° → act {d.actual ?? '—'} (Δ{d.deviation})
+                              G/S: {d.competitorName} — pred {d.predicted}° → act {d.actual ?? '—'} ({deviationLabel(d)})
                             </span>
                             <span className="text-green-600 font-black">{d.points} pts</span>
                           </div>
@@ -745,7 +771,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
                         {b.bronze.map((d) => (
                           <div key={`br-${d.competitorId}`} className="flex justify-between">
                             <span className="text-slate-700">
-                              Bronze: {d.competitorName} — Δ{d.deviation}
+                              Bronze: {d.competitorName} — {deviationLabel(d)}
                             </span>
                             <span className="text-green-600 font-black">{d.points} pts</span>
                           </div>
@@ -757,6 +783,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
                           Additional pick: {b.additionalPick.points} pts
                           {b.additionalPick.actualPosition != null && ` (place ${b.additionalPick.actualPosition})`}
                         </p>
+                        <GoldenLinesList lines={b.goldenLines} />
                         <p className="font-black text-primary border-t pt-2">Category: {b.categoryTotal} pts</p>
                       </div>
                     </div>
@@ -770,6 +797,7 @@ const TournamentFinalResults: React.FC<TournamentFinalResultsProps> = ({ onNavig
                 );
               })}
             </div>
+            </>)}
           </section>
         )}
       </main>

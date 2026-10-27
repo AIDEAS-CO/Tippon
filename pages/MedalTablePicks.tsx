@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { ViewState, Tournament, UserPicks } from '../types';
 import { ArrowLeft, CheckCircle, Loader2, Lock } from 'lucide-react';
 import { supabase } from '../lib/supabaseClient';
+import { lookupByWeight } from '../lib/rankings';
 import Flag from '../components/ui/Flag';
 import {
   MEDAL_TABLE_MEN,
@@ -49,7 +50,8 @@ interface MedalTablePicksProps {
   onNavigate: (view: ViewState) => void;
   tournament: Tournament | null;
   userId?: string;
-  onSavePicks?: (tournamentId: string, category: string, picks: UserPicks, completion: number) => void;
+  /** May resolve to false when the server rejected the save (picks locked). */
+  onSavePicks?: (tournamentId: string, category: string, picks: UserPicks, completion: number) => void | Promise<boolean | void>;
   medalTableStatus?: 'open' | 'locked';
 }
 
@@ -120,7 +122,8 @@ const MedalTablePicks: React.FC<MedalTablePicksProps> = ({
         for (const [country, cats] of bracketCountryMap) {
           totalSet.add(country);
           for (const cat of cats) {
-            const gender = catGender.get(cat);
+            // Only exact 'Male'/'Female'; Mixed / unknown count toward Total only
+            const gender = lookupByWeight(catGender, cat);
             if (gender === 'Male') menSet.add(country);
             else if (gender === 'Female') womenSet.add(country);
           }
@@ -132,7 +135,7 @@ const MedalTablePicks: React.FC<MedalTablePicksProps> = ({
           if (!code || code === 'N/A' || code.length < 2) continue;
           totalSet.add(code);
           if (r.weight_category) {
-            const gender = catGender.get(r.weight_category);
+            const gender = lookupByWeight(catGender, r.weight_category);
             if (gender === 'Male') menSet.add(code);
             else if (gender === 'Female') womenSet.add(code);
           }
@@ -205,7 +208,7 @@ const MedalTablePicks: React.FC<MedalTablePicksProps> = ({
 
   const completion = filledCount >= RANK_SLOTS ? 100 : Math.round((filledCount / RANK_SLOTS) * 100);
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!tournament?.id || !onSavePicks) return;
     const vals = Object.values(ranks).filter(Boolean);
     if (new Set(vals).size !== vals.length) {
@@ -214,7 +217,11 @@ const MedalTablePicks: React.FC<MedalTablePicksProps> = ({
     }
     setSaveError(null);
     setSaving(activeTab);
-    onSavePicks(tournament.id, TAB_CATEGORY[activeTab], ranks, completion);
+    const ok = await onSavePicks(tournament.id, TAB_CATEGORY[activeTab], ranks, completion);
+    if (ok === false) {
+      setSaving(null);
+      return;
+    }
     setTimeout(() => {
       setSaving(null);
       setSavedFlash(true);

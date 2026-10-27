@@ -9,6 +9,17 @@ export interface CountryMedalRow {
 }
 
 /**
+ * Country code for a standing row. Teams brackets use countries as competitors
+ * (name = IOC code), so fall back to a 3-letter name when country is missing.
+ */
+export function standingCountryCode(country?: string, competitorName?: string): string {
+  if (country && country !== 'N/A') return String(country).trim().toUpperCase();
+  const name = String(competitorName || '').trim();
+  if (/^[A-Za-z]{3}$/.test(name)) return name.toUpperCase();
+  return '?';
+}
+
+/**
  * Aggregate gold/silver/bronze by country across all weight categories from saved match results,
  * then sort by IJF-style medal table order (golds, then silvers, then bronzes, then code).
  */
@@ -33,8 +44,7 @@ export function computeCountryMedalRanking(
     const picks = resultsByCat.get(cat) || {};
     const st = deriveStandings(built, picks);
     for (const row of st) {
-      const cc =
-        row.country && row.country !== 'N/A' ? String(row.country).toUpperCase() : '?';
+      const cc = standingCountryCode(row.country, row.competitorName);
       if (row.position === 1) bump(cc, 'g');
       else if (row.position === 2) bump(cc, 's');
       else if (row.position === 3) bump(cc, 'b');

@@ -3,7 +3,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Tippon</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -96,9 +96,11 @@
           transition: background-color 5000s ease-in-out 0s;
           border-radius: 0.75rem !important; /* Matches rounded-xl */
       }
+      /* Dynamic viewport height so mobile browser chrome does not hide content */
+      @supports (height: 100dvh) { .app-shell.app-shell { height: 100dvh; } }
     </style>
 </head>
-  <body class="bg-background-light text-slate-900 antialiased overflow-hidden">
+  <body class="bg-background-light text-slate-900 antialiased">
     <div id="root"></div>
   <script type="module" src="/index.tsx"></script>
 </body>
